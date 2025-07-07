@@ -12,6 +12,11 @@ services:
       - redis
     networks:
       - observer-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "8m"
+        max-file: "3"
 
   vector-aggregator:
     image: timberio/vector:0.48.0-alpine
@@ -26,6 +31,11 @@ services:
       - observer
     networks:
       - observer-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "8m"
+        max-file: "3"
 
   nginx:
     image: nginx:mainline-alpine
@@ -40,6 +50,11 @@ services:
       - vector-aggregator
     networks:
       - observer-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "8m"
+        max-file: "3"
 
   redis:
     image: redis:8.2-m01-alpine3.22
@@ -51,6 +66,11 @@ services:
       - redis-data:/data
     networks:
       - observer-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "8m"
+        max-file: "3"
 
 networks:
   observer-net:
@@ -58,4 +78,3 @@ networks:
 
 volumes:
   redis-data:
-
