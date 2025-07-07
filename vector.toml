@@ -1,0 +1,22 @@
+# Источник: принимаем данные по HTTP от Nginx.
+# SSL здесь НЕ настраивается, т.к. Nginx его уже обработал.
+[sources.http_receiver]
+  type = "http"
+  # Слушаем на всех интерфейсах внутри Docker-сети на порту 8686
+  address = "0.0.0.0:8686"
+  # Указываем, что тело запроса - это JSON
+  decoding.codec = "json"
+
+# Назначение: отправляем полученные данные в сервис-наблюдатель.
+[sinks.observer_service]
+  type = "http"
+  inputs = ["http_receiver"]
+  # Используем имя сервиса 'observer' из docker-compose и его внутренний порт
+  uri = "http://observer:9000/log-entry"
+  method = "post"
+  encoding.codec = "json"
+
+  # Настройки пакетной отправки
+  batch.max_events = 100
+  batch.timeout_secs = 5
+
