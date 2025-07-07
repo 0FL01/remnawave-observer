@@ -84,7 +84,15 @@ async def process_log_entries(entries: List[LogEntry]):
             # result[0] - результат SADD (не используем)
             # result[1] - результат EXPIRE (не используем)
             current_ip_count = results[2]
-            alert_was_sent = results[3]
+            alert_was_sent = bool(results[3])
+
+            # Добавляем лог для отладки
+            logger.info(
+                f"Проверка пользователя: {entry.user_email}. "
+                f"IP-адресов: {current_ip_count}. "
+                f"Лимит: {MAX_IPS_PER_USER}. "
+                f"Алерт уже отправлен (в кулдауне): {alert_was_sent}."
+            )
 
             # Проверяем условие для отправки алерта
             if current_ip_count > MAX_IPS_PER_USER and not alert_was_sent:
