@@ -1,15 +1,19 @@
 services:
   observer:
     container_name: observer
-    build:
-      context: ./observer
+    image: 0fl01/observer-xray:0.0.1
     restart: unless-stopped
     expose:
       - "9000"
     env_file:
       - .env
     depends_on:
-      - redis
+      rabbitmq:
+        condition: service_healthy
+      vector-aggregator:
+        condition: service_started
+      redis:
+        condition: service_started
     networks:
       - observer-net
     logging:
@@ -17,6 +21,27 @@ services:
       options:
         max-size: "8m"
         max-file: "3"
+
+  rabbitmq:
+    image: rabbitmq:4.1.2-management-alpine
+    container_name: rabbimq-xray
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    environment:
+      - RABBITMQ_DEFAULT_USER=chumba
+      - RABBITMQ_DEFAULT_PASS=${RABBIT_PASSWD}
+    networks:
+      - observer-net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   vector-aggregator:
     image: timberio/vector:0.48.0-alpine
@@ -27,8 +52,6 @@ services:
     expose:
       - "8686"
     command: ["--config", "/etc/vector/vector.toml"]
-    depends_on:
-      - observer
     networks:
       - observer-net
     logging:
@@ -42,7 +65,7 @@ services:
     container_name: nginx-proxy
     restart: unless-stopped
     ports:
-      - "7443:443"
+      - "38213:443"
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
@@ -78,3 +101,4 @@ networks:
 
 volumes:
   redis-data:
+  rabbitmq-data:
