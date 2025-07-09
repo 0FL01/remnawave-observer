@@ -1,7 +1,9 @@
 import os
 import json
 import logging
-from typing import List, Set
+import asyncio
+from typing import List, Set, Dict
+from datetime import datetime
 import httpx
 import aio_pika
 import redis.asyncio as redis
@@ -21,6 +23,7 @@ USER_IP_TTL_SECONDS = int(os.getenv("USER_IP_TTL_SECONDS", 24 * 60 * 60))
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", 60 * 60))
 BLOCK_DURATION = os.getenv("BLOCK_DURATION", "5m")
 BLOCKING_EXCHANGE_NAME = "blocking_exchange"
+MONITORING_INTERVAL = int(os.getenv("MONITORING_INTERVAL", 300))  # 5 минут по умолчанию
 
 # Обработка списка исключений
 excluded_users_str = os.getenv("EXCLUDED_USERS", "")
@@ -35,11 +38,122 @@ redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 http_client = httpx.AsyncClient()
 rabbitmq_connection = None
 blocking_exchange = None
+monitoring_task = None
+
+async def monitor_user_ip_pools():
+    """Периодический мониторинг IP-пулов пользователей."""
+    while True:
+        try:
+            await asyncio.sleep(MONITORING_INTERVAL)
+            
+            # Получаем все ключи пользователей
+            pattern = "user_ips:*"
+            user_keys = await redis_client.keys(pattern)
+            
+            if not user_keys:
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] === IP POOLS MONITORING === НЕТ АКТИВНЫХ ПОЛЬЗОВАТЕЛЕЙ")
+                continue
+            
+            print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] === IP POOLS MONITORING START ===")
+            
+            total_users = 0
+            users_near_limit = 0
+            users_over_limit = 0
+            
+            # Собираем информацию о каждом пользователе
+            user_stats: List[Dict] = []
+            
+            for key in user_keys:
+                try:
+                    user_email = key.split(":", 1)[1]
+                    
+                    # Получаем количество IP и TTL
+                    async with redis_client.pipeline() as pipe:
+                        pipe.scard(key)
+                        pipe.ttl(key)
+                        pipe.smembers(key)
+                        results = await pipe.execute()
+                    
+                    ip_count = results[0]
+                    ttl = results[1]
+                    ips = results[2]
+                    
+                    if ip_count > 0:
+                        total_users += 1
+                        
+                        # Определяем статус пользователя
+                        status = "NORMAL"
+                        if ip_count >= MAX_IPS_PER_USER * 0.8:  # 80% от лимита
+                            status = "NEAR_LIMIT"
+                            users_near_limit += 1
+                        if ip_count > MAX_IPS_PER_USER:
+                            status = "OVER_LIMIT"
+                            users_over_limit += 1
+                        
+                        # Проверяем, есть ли активный кулдаун на алерты
+                        alert_cooldown_key = f"alert_sent:{user_email}"
+                        has_alert_cooldown = await redis_client.exists(alert_cooldown_key)
+                        
+                        user_stats.append({
+                            'email': user_email,
+                            'ip_count': ip_count,
+                            'ips': sorted(list(ips)),
+                            'ttl_hours': round(ttl / 3600, 1) if ttl > 0 else 0,
+                            'status': status,
+                            'has_alert_cooldown': bool(has_alert_cooldown),
+                            'excluded': user_email in EXCLUDED_USERS
+                        })
+                
+                except Exception as e:
+                    logger.error(f"Ошибка при обработке ключа {key}: {e}")
+            
+            # Сортируем по количеству IP (по убыванию)
+            user_stats.sort(key=lambda x: x['ip_count'], reverse=True)
+            
+            # Выводим общую статистику
+            print(f"📊 ОБЩАЯ СТАТИСТИКА:")
+            print(f"   👥 Всего активных пользователей: {total_users}")
+            print(f"   ⚠️  Близко к лимиту ({MAX_IPS_PER_USER}): {users_near_limit}")
+            print(f"   🚨 Превышение лимита: {users_over_limit}")
+            print(f"   🛡️  Исключенных пользователей: {len([u for u in user_stats if u['excluded']])}")
+            
+            # Выводим топ-10 пользователей с наибольшим количеством IP
+            print(f"\n📈 ТОП ПОЛЬЗОВАТЕЛИ ПО КОЛИЧЕСТВУ IP:")
+            for i, user in enumerate(user_stats[:10], 1):
+                status_emoji = {
+                    'NORMAL': '✅',
+                    'NEAR_LIMIT': '⚠️',
+                    'OVER_LIMIT': '🚨'
+                }.get(user['status'], '❓')
+                
+                excluded_marker = ' [EXCLUDED]' if user['excluded'] else ''
+                cooldown_marker = ' [ALERT_COOLDOWN]' if user['has_alert_cooldown'] else ''
+                
+                print(f"   {i:2d}. {status_emoji} {user['email']}{excluded_marker}{cooldown_marker}")
+                print(f"       IP: {user['ip_count']}/{MAX_IPS_PER_USER} | TTL: {user['ttl_hours']}h")
+                print(f"       IPs: {', '.join(user['ips'])}")
+            
+            # Отдельно выводим всех пользователей с превышением лимита
+            over_limit_users = [u for u in user_stats if u['status'] == 'OVER_LIMIT']
+            if over_limit_users:
+                print(f"\n🚨 ПОЛЬЗОВАТЕЛИ С ПРЕВЫШЕНИЕМ ЛИМИТА:")
+                for user in over_limit_users:
+                    excluded_marker = ' [EXCLUDED - НЕ БЛОКИРУЕТСЯ]' if user['excluded'] else ''
+                    cooldown_marker = ' [ALERT_COOLDOWN]' if user['has_alert_cooldown'] else ''
+                    print(f"   • {user['email']}{excluded_marker}{cooldown_marker}")
+                    print(f"     IP: {user['ip_count']}/{MAX_IPS_PER_USER} | TTL: {user['ttl_hours']}h")
+                    print(f"     IPs: {', '.join(user['ips'])}")
+            
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] === IP POOLS MONITORING END ===\n")
+            
+        except Exception as e:
+            logger.error(f"Критическая ошибка в мониторинге IP-пулов: {e}")
+            await asyncio.sleep(30)  # Короткая пауза перед повторной попыткой
 
 @app.on_event("startup")
 async def startup_event():
-    """Подключение к RabbitMQ при старте приложения."""
-    global rabbitmq_connection, blocking_exchange
+    """Подключение к RabbitMQ и запуск мониторинга при старте приложения."""
+    global rabbitmq_connection, blocking_exchange, monitoring_task
     try:
         rabbitmq_connection = await aio_pika.connect_robust(RABBITMQ_URL)
         channel = await rabbitmq_connection.channel()
@@ -50,10 +164,25 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Не удалось подключиться к RabbitMQ: {e}")
         rabbitmq_connection = None
+    
+    # Запуск задачи мониторинга IP-пулов
+    monitoring_task = asyncio.create_task(monitor_user_ip_pools())
+    logger.info(f"Мониторинг IP-пулов запущен с интервалом {MONITORING_INTERVAL} секунд.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Корректное закрытие соединений."""
+    global monitoring_task
+    
+    # Остановка задачи мониторинга
+    if monitoring_task:
+        monitoring_task.cancel()
+        try:
+            await monitoring_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Мониторинг IP-пулов остановлен.")
+    
     if rabbitmq_connection:
         await rabbitmq_connection.close()
     await http_client.aclose()
@@ -135,3 +264,60 @@ async def health_check():
         return {"status": "ok", "redis_connection": "ok"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Redis connection failed: {e}")
+
+@app.get("/user-ip-stats")
+async def get_user_ip_stats():
+    """Эндпоинт для получения статистики IP-пулов пользователей в реальном времени."""
+    try:
+        pattern = "user_ips:*"
+        user_keys = await redis_client.keys(pattern)
+        
+        if not user_keys:
+            return {"total_users": 0, "users": []}
+        
+        user_stats = []
+        
+        for key in user_keys:
+            try:
+                user_email = key.split(":", 1)[1]
+                
+                async with redis_client.pipeline() as pipe:
+                    pipe.scard(key)
+                    pipe.ttl(key)
+                    pipe.smembers(key)
+                    results = await pipe.execute()
+                
+                ip_count = results[0]
+                ttl = results[1]
+                ips = results[2]
+                
+                if ip_count > 0:
+                    alert_cooldown_key = f"alert_sent:{user_email}"
+                    has_alert_cooldown = await redis_client.exists(alert_cooldown_key)
+                    
+                    user_stats.append({
+                        'email': user_email,
+                        'ip_count': ip_count,
+                        'ips': sorted(list(ips)),
+                        'ttl_seconds': ttl if ttl > 0 else 0,
+                        'over_limit': ip_count > MAX_IPS_PER_USER,
+                        'has_alert_cooldown': bool(has_alert_cooldown),
+                        'excluded': user_email in EXCLUDED_USERS
+                    })
+            
+            except Exception as e:
+                logger.error(f"Ошибка при обработке ключа {key}: {e}")
+        
+        user_stats.sort(key=lambda x: x['ip_count'], reverse=True)
+        
+        return {
+            "total_users": len(user_stats),
+            "users_over_limit": len([u for u in user_stats if u['over_limit']]),
+            "monitoring_interval": MONITORING_INTERVAL,
+            "max_ips_per_user": MAX_IPS_PER_USER,
+            "users": user_stats
+        }
+    
+    except Exception as e:
+        logger.error(f"Ошибка при получении статистики IP-пулов: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get IP stats: {e}")
