@@ -25,12 +25,19 @@ BLOCK_DURATION = os.getenv("BLOCK_DURATION", "5m")
 BLOCKING_EXCHANGE_NAME = "blocking_exchange"
 MONITORING_INTERVAL = int(os.getenv("MONITORING_INTERVAL", 300))  # 5 минут по умолчанию
 
+# Настройки дебага
+DEBUG_EMAIL = os.getenv("DEBUG_EMAIL", "")
+DEBUG_IP_LIMIT = int(os.getenv("DEBUG_IP_LIMIT", 1))
+
 # Обработка списка исключений
 excluded_users_str = os.getenv("EXCLUDED_USERS", "")
 EXCLUDED_USERS: Set[str] = {email.strip() for email in excluded_users_str.split(',') if email.strip()}
 
 if EXCLUDED_USERS:
     logger.info(f"Загружен список исключений: {len(EXCLUDED_USERS)} пользователей.")
+
+if DEBUG_EMAIL:
+    logger.info(f"Режим дебага включен для email: {DEBUG_EMAIL} с лимитом IP: {DEBUG_IP_LIMIT}")
 
 # Глобальные переменные для соединений
 app = FastAPI(title="Observer Service", version="1.2.1")
@@ -39,6 +46,12 @@ http_client = httpx.AsyncClient()
 rabbitmq_connection = None
 blocking_exchange = None
 monitoring_task = None
+
+def get_user_ip_limit(user_email: str) -> int:
+    """Возвращает лимит IP для пользователя (с учетом дебага)."""
+    if DEBUG_EMAIL and user_email == DEBUG_EMAIL:
+        return DEBUG_IP_LIMIT
+    return MAX_IPS_PER_USER
 
 async def get_user_active_ips(user_email: str) -> Dict[str, int]:
     """
@@ -94,6 +107,39 @@ async def cleanup_expired_user_ips(user_email: str) -> int:
     
     return len(expired_keys)
 
+async def delayed_clear_user_ips(user_email: str, delay_seconds: int = 10):
+    """
+    Отложенная очистка IP-адресов пользователя после применения блокировки.
+    Ждет указанное количество секунд, чтобы система блокировок успела 
+    добавить IP в nftables с таймаутом.
+    """
+    try:
+        await asyncio.sleep(delay_seconds)
+        cleared_count = await clear_user_ips_after_block(user_email)
+        debug_marker = " [DEBUG]" if DEBUG_EMAIL and user_email == DEBUG_EMAIL else ""
+        logger.info(f"Отложенная очистка IP для {user_email}{debug_marker} выполнена через {delay_seconds} секунд")
+    except Exception as e:
+        logger.error(f"Ошибка при отложенной очистке IP для {user_email}: {e}")
+
+async def clear_user_ips_after_block(user_email: str) -> int:
+    """
+    Очищает все IP-адреса пользователя после применения блокировки.
+    Возвращает количество удаленных IP.
+    """
+    user_ips_pattern = f"user_ip:{user_email}:*"
+    ip_keys = await redis_client.keys(user_ips_pattern)
+    
+    if not ip_keys:
+        return 0
+    
+    # Удаляем все IP-ключи пользователя
+    deleted_count = await redis_client.delete(*ip_keys)
+    
+    debug_marker = " [DEBUG]" if DEBUG_EMAIL and user_email == DEBUG_EMAIL else ""
+    logger.info(f"Очищено {deleted_count} IP-адресов для заблокированного пользователя {user_email}{debug_marker}")
+    
+    return deleted_count
+
 async def monitor_user_ip_pools():
     """Периодический мониторинг IP-пулов пользователей."""
     while True:
@@ -134,12 +180,15 @@ async def monitor_user_ip_pools():
                         total_users += 1
                         ip_count = len(active_ips)
                         
+                        # Получаем лимит для конкретного пользователя
+                        user_limit = get_user_ip_limit(user_email)
+                        
                         # Определяем статус пользователя
                         status = "NORMAL"
-                        if ip_count >= MAX_IPS_PER_USER * 0.8:  # 80% от лимита
+                        if ip_count >= user_limit * 0.8:  # 80% от лимита
                             status = "NEAR_LIMIT"
                             users_near_limit += 1
-                        if ip_count > MAX_IPS_PER_USER:
+                        if ip_count > user_limit:
                             status = "OVER_LIMIT"
                             users_over_limit += 1
                         
@@ -156,13 +205,15 @@ async def monitor_user_ip_pools():
                         user_stats.append({
                             'email': user_email,
                             'ip_count': ip_count,
+                            'limit': user_limit,
                             'ips': sorted(list(active_ips.keys())),
                             'ips_with_ttl': sorted(ips_with_ttl),
                             'min_ttl_hours': round(min(active_ips.values()) / 3600, 1),
                             'max_ttl_hours': round(max(active_ips.values()) / 3600, 1),
                             'status': status,
                             'has_alert_cooldown': bool(has_alert_cooldown),
-                            'excluded': user_email in EXCLUDED_USERS
+                            'excluded': user_email in EXCLUDED_USERS,
+                            'is_debug': DEBUG_EMAIL and user_email == DEBUG_EMAIL
                         })
                 
                 except Exception as e:
@@ -174,9 +225,12 @@ async def monitor_user_ip_pools():
             # Выводим общую статистику
             print(f"📊 ОБЩАЯ СТАТИСТИКА:")
             print(f"   👥 Всего активных пользователей: {total_users}")
-            print(f"   ⚠️  Близко к лимиту ({MAX_IPS_PER_USER}): {users_near_limit}")
+            print(f"   ⚠️  Близко к лимиту: {users_near_limit}")
             print(f"   🚨 Превышение лимита: {users_over_limit}")
             print(f"   🛡️  Исключенных пользователей: {len([u for u in user_stats if u['excluded']])}")
+            if DEBUG_EMAIL:
+                debug_users = [u for u in user_stats if u['is_debug']]
+                print(f"   🐛 Debug пользователей: {len(debug_users)}")
             
             # Выводим топ-10 пользователей с наибольшим количеством IP
             print(f"\n📈 ТОП ПОЛЬЗОВАТЕЛИ ПО КОЛИЧЕСТВУ IP:")
@@ -189,9 +243,10 @@ async def monitor_user_ip_pools():
                 
                 excluded_marker = ' [EXCLUDED]' if user['excluded'] else ''
                 cooldown_marker = ' [ALERT_COOLDOWN]' if user['has_alert_cooldown'] else ''
+                debug_marker = ' [DEBUG]' if user['is_debug'] else ''
                 
-                print(f"   {i:2d}. {status_emoji} {user['email']}{excluded_marker}{cooldown_marker}")
-                print(f"       IP: {user['ip_count']}/{MAX_IPS_PER_USER} | TTL: {user['min_ttl_hours']}-{user['max_ttl_hours']}h")
+                print(f"   {i:2d}. {status_emoji} {user['email']}{excluded_marker}{cooldown_marker}{debug_marker}")
+                print(f"       IP: {user['ip_count']}/{user['limit']} | TTL: {user['min_ttl_hours']}-{user['max_ttl_hours']}h")
                 print(f"       IPs: {', '.join(user['ips_with_ttl'])}")
             
             # Отдельно выводим всех пользователей с превышением лимита
@@ -201,8 +256,9 @@ async def monitor_user_ip_pools():
                 for user in over_limit_users:
                     excluded_marker = ' [EXCLUDED - НЕ БЛОКИРУЕТСЯ]' if user['excluded'] else ''
                     cooldown_marker = ' [ALERT_COOLDOWN]' if user['has_alert_cooldown'] else ''
-                    print(f"   • {user['email']}{excluded_marker}{cooldown_marker}")
-                    print(f"     IP: {user['ip_count']}/{MAX_IPS_PER_USER} | TTL: {user['min_ttl_hours']}-{user['max_ttl_hours']}h")
+                    debug_marker = ' [DEBUG]' if user['is_debug'] else ''
+                    print(f"   • {user['email']}{excluded_marker}{cooldown_marker}{debug_marker}")
+                    print(f"     IP: {user['ip_count']}/{user['limit']} | TTL: {user['min_ttl_hours']}-{user['max_ttl_hours']}h")
                     print(f"     IPs: {', '.join(user['ips_with_ttl'])}")
             
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] === IP POOLS MONITORING END ===\n")
@@ -270,6 +326,9 @@ async def process_log_entries(entries: List[LogEntry]):
             if entry.user_email in EXCLUDED_USERS:
                 continue
 
+            # Получаем лимит IP для конкретного пользователя
+            user_ip_limit = get_user_ip_limit(entry.user_email)
+
             # Новая схема: отдельный ключ для каждого IP
             user_ip_key = f"user_ip:{entry.user_email}:{entry.source_ip}"
             alert_sent_key = f"alert_sent:{entry.user_email}"
@@ -287,13 +346,15 @@ async def process_log_entries(entries: List[LogEntry]):
             # Проверяем кулдаун на алерты
             alert_was_sent = await redis_client.exists(alert_sent_key)
 
-            # Логируем только если IP новый
+            # Логируем с учетом дебага
             if not ip_exists:
-                logger.info(f"Новый IP для пользователя {entry.user_email}: {entry.source_ip}. Всего IP: {current_ip_count}")
+                debug_marker = " [DEBUG]" if DEBUG_EMAIL and entry.user_email == DEBUG_EMAIL else ""
+                logger.info(f"Новый IP для пользователя {entry.user_email}{debug_marker}: {entry.source_ip}. Всего IP: {current_ip_count}/{user_ip_limit}")
 
             # Проверка на превышение лимита и отсутствие кулдауна
-            if current_ip_count > MAX_IPS_PER_USER and not alert_was_sent:
-                logger.warning(f"ПРЕВЫШЕНИЕ ЛИМИТА: Пользователь {entry.user_email}, IP-адресов: {current_ip_count}/{MAX_IPS_PER_USER}.")
+            if current_ip_count > user_ip_limit and not alert_was_sent:
+                debug_marker = " [DEBUG]" if DEBUG_EMAIL and entry.user_email == DEBUG_EMAIL else ""
+                logger.warning(f"ПРЕВЫШЕНИЕ ЛИМИТА{debug_marker}: Пользователь {entry.user_email}, IP-адресов: {current_ip_count}/{user_ip_limit}.")
                 
                 # Получаем список всех активных IP
                 all_user_ips = list(active_ips.keys())
@@ -306,7 +367,11 @@ async def process_log_entries(entries: List[LogEntry]):
                         delivery_mode=aio_pika.DeliveryMode.PERSISTENT
                     )
                     await blocking_exchange.publish(message, routing_key="")
-                    logger.info(f"Сообщение о блокировке для {entry.user_email} отправлено.")
+                    logger.info(f"Сообщение о блокировке для {entry.user_email}{debug_marker} отправлено.")
+                    
+                    # ОТЛОЖЕННАЯ ОЧИСТКА IP-АДРЕСОВ ПОЛЬЗОВАТЕЛЯ
+                    # Ждем 10 секунд, чтобы система блокировок успела добавить IP в nftables с таймаутом
+                    asyncio.create_task(delayed_clear_user_ips(entry.user_email, delay_seconds=30))
                 
                 # Установка кулдауна на алерты и отправка уведомления
                 await redis_client.setex(alert_sent_key, ALERT_COOLDOWN_SECONDS, "1")
@@ -314,7 +379,7 @@ async def process_log_entries(entries: List[LogEntry]):
                     alert_payload = AlertPayload(
                         user_identifier=entry.user_email,
                         detected_ips_count=current_ip_count,
-                        limit=MAX_IPS_PER_USER,
+                        limit=user_ip_limit,
                     )
                     try:
                         await http_client.post(ALERT_WEBHOOK_URL, json=alert_payload.dict(), timeout=10.0)
