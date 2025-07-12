@@ -315,6 +315,8 @@ class AlertPayload(BaseModel):
     user_identifier: str
     detected_ips_count: int
     limit: int
+    all_user_ips: list[str]  # Добавляем поле для списка IP
+    block_duration: str      # Добавляем поле для длительности блокировки
     violation_type: str = "ip_limit_exceeded"
 
 @app.post("/log-entry")
@@ -376,15 +378,19 @@ async def process_log_entries(entries: List[LogEntry]):
                 # Установка кулдауна на алерты и отправка уведомления
                 await redis_client.setex(alert_sent_key, ALERT_COOLDOWN_SECONDS, "1")
                 if ALERT_WEBHOOK_URL:
+                    # Формируем новый payload для вебхука
                     alert_payload = AlertPayload(
                         user_identifier=entry.user_email,
                         detected_ips_count=current_ip_count,
                         limit=user_ip_limit,
+                        all_user_ips=all_user_ips,  # Передаем список IP
+                        block_duration=BLOCK_DURATION  # Передаем длительность
                     )
                     try:
                         await http_client.post(ALERT_WEBHOOK_URL, json=alert_payload.dict(), timeout=10.0)
+                        logger.info(f"Вебхук-уведомление для {entry.user_email} успешно отправлен.")
                     except httpx.RequestError as e:
-                        logger.error(f"Ошибка отправки алерта для {entry.user_email}: {e}")
+                        logger.error(f"Ошибка отправки вебхук-уведомления для {entry.user_email}: {e}")
 
         except Exception as e:
             logger.error(f"Критическая ошибка при обработке записи для {entry.user_email}: {e}")
