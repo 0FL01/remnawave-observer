@@ -1,7 +1,7 @@
 services:
   observer:
     container_name: observer
-    image: 0fl01/observer-xray:0.0.1
+    image: quay.io/0fl01/observer-xray-go:0.0.1
     restart: unless-stopped
     expose:
       - "9000"
