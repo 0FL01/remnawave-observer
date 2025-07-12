@@ -11,18 +11,15 @@ RUN go mod download
 COPY . .
 
 # Компилируем статически скомпонованный бинарник без отладочной информации для уменьшения размера
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o blocker-worker .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o observer_service .
 
 # Используем Alpine, так как он очень маленький и содержит нужные пакеты
 FROM alpine:3.22
 
-# Устанавливаем только nftables и больше ничего лишнего
-RUN apk --no-cache add nftables
-
 WORKDIR /app
 
 # Копируем только скомпилированный бинарник из сборщика
-COPY --from=builder /app/blocker-worker .
+COPY --from=builder /app/observer_service .
 
 # Устанавливаем команду по умолчанию
-CMD ["/app/blocker-worker"]
+CMD ["/app/observer_service"]

@@ -391,7 +391,7 @@ async def process_log_entries(entries: List[LogEntry]):
                         response = await http_client.post(
                             ALERT_WEBHOOK_URL, 
                             json=alert_payload.dict(), 
-                            timeout=15.0 # Немного увеличим таймаут
+                            timeout=15.0
                         )
                         # Логируем статус и тело ответа от бота
                         logger.info(
