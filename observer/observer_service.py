@@ -372,25 +372,38 @@ async def process_log_entries(entries: List[LogEntry]):
                     logger.info(f"Сообщение о блокировке для {entry.user_email}{debug_marker} отправлено.")
                     
                     # ОТЛОЖЕННАЯ ОЧИСТКА IP-АДРЕСОВ ПОЛЬЗОВАТЕЛЯ
-                    # Ждем 10 секунд, чтобы система блокировок успела добавить IP в nftables с таймаутом
+                    # Ждем 30 секунд, чтобы система блокировок успела добавить IP в nftables с таймаутом
                     asyncio.create_task(delayed_clear_user_ips(entry.user_email, delay_seconds=30))
                 
                 # Установка кулдауна на алерты и отправка уведомления
                 await redis_client.setex(alert_sent_key, ALERT_COOLDOWN_SECONDS, "1")
                 if ALERT_WEBHOOK_URL:
-                    # Формируем новый payload для вебхука
                     alert_payload = AlertPayload(
                         user_identifier=entry.user_email,
                         detected_ips_count=current_ip_count,
                         limit=user_ip_limit,
-                        all_user_ips=all_user_ips,  # Передаем список IP
-                        block_duration=BLOCK_DURATION  # Передаем длительность
+                        all_user_ips=all_user_ips,
+                        block_duration=BLOCK_DURATION
                     )
+                    # --- ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ ---
+                    logger.info(f"Попытка отправить вебхук на URL: {ALERT_WEBHOOK_URL}")
                     try:
-                        await http_client.post(ALERT_WEBHOOK_URL, json=alert_payload.dict(), timeout=10.0)
-                        logger.info(f"Вебхук-уведомление для {entry.user_email} успешно отправлен.")
+                        response = await http_client.post(
+                            ALERT_WEBHOOK_URL, 
+                            json=alert_payload.dict(), 
+                            timeout=15.0 # Немного увеличим таймаут
+                        )
+                        # Логируем статус и тело ответа от бота
+                        logger.info(
+                            f"Вебхук-уведомление для {entry.user_email} отправлен. "
+                            f"Статус ответа: {response.status_code}. Тело ответа: {response.text}"
+                        )
                     except httpx.RequestError as e:
-                        logger.error(f"Ошибка отправки вебхук-уведомления для {entry.user_email}: {e}")
+                        logger.error(f"Сетевая ошибка при отправке вебхук-уведомления для {entry.user_email}: {e}")
+                    except Exception as e:
+                        logger.error(f"Непредвиденная ошибка при отправке вебхук-уведомления: {e}", exc_info=True)
+                else:
+                    logger.warning("ALERT_WEBHOOK_URL не задан, вебхук не отправляется.")
 
         except Exception as e:
             logger.error(f"Критическая ошибка при обработке записи для {entry.user_email}: {e}")
