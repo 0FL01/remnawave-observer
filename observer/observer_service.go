@@ -200,6 +200,21 @@ func connectRabbitMQ() error {
 	return nil
 }
 
+// connectRabbitMQWithRetry пытается подключиться к RabbitMQ с указанным количеством
+// повторных попыток и задержкой между ними.
+func connectRabbitMQWithRetry(maxRetries int, delay time.Duration) error {
+	var err error
+	for i := 0; i < maxRetries; i++ {
+		err = connectRabbitMQ()
+		if err == nil {
+			return nil
+		}
+		log.Printf("Не удалось подключиться к RabbitMQ (попытка %d/%d): %v. Повтор через %v...", i+1, maxRetries, err, delay)
+		time.Sleep(delay)
+	}
+	return fmt.Errorf("не удалось подключиться к RabbitMQ после %d попыток: %w", maxRetries, err)
+}
+
 func getUserActiveIPs(ctx context.Context, userEmail string) (map[string]int, error) {
 	pattern := fmt.Sprintf("user_ip:%s:*", userEmail)
 	keys, err := redisClient.Keys(ctx, pattern).Result()
@@ -695,14 +710,15 @@ func main() {
 		log.Fatalf("Ошибка подключения к Redis: %v", err)
 	}
 	defer redisClient.Close()
-	
-	// Подключение к RabbitMQ
-	if err := connectRabbitMQ(); err != nil {
-		log.Printf("Предупреждение: Не удалось подключиться к RabbitMQ: %v", err)
-	} else {
-		defer rabbitConn.Close()
-		defer blockingChannel.Close()
+
+	// Подключение к RabbitMQ с логикой ретраев
+	const maxRabbitRetries = 10
+	const rabbitRetryDelay = 5 * time.Second
+	if err := connectRabbitMQWithRetry(maxRabbitRetries, rabbitRetryDelay); err != nil {
+		log.Fatalf("Критическая ошибка: не удалось подключиться к RabbitMQ: %v", err)
 	}
+	defer rabbitConn.Close()
+	defer blockingChannel.Close()
 	
 	// Запуск мониторинга IP-пулов
 	go monitorUserIPPools()
