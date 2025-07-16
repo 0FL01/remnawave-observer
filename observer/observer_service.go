@@ -60,6 +60,7 @@ var (
 	rabbitConn      *amqp091.Connection
 	blockingChannel *amqp091.Channel
 	excludedUsers   map[string]bool
+	excludedIPs     map[string]bool
 	
 	// Конфигурация из переменных окружения
 	redisURL           string
@@ -109,9 +110,26 @@ func init() {
 			}
 		}
 	}
-	
+
+	// Обработка списка исключенных IP-адресов
+	excludedIPsStr := getEnv("EXCLUDED_IPS", "")
+	excludedIPs = make(map[string]bool)
+	if excludedIPsStr != "" {
+		ips := strings.Split(excludedIPsStr, ",")
+		for _, ip := range ips {
+			ip = strings.TrimSpace(ip)
+			if ip != "" {
+				excludedIPs[ip] = true
+			}
+		}
+	}
+
 	if len(excludedUsers) > 0 {
 		log.Printf("Загружен список исключений: %d пользователей", len(excludedUsers))
+	}
+
+	if len(excludedIPs) > 0 {
+		log.Printf("Загружен список исключений IP-адресов: %d", len(excludedIPs))
 	}
 	
 	if debugEmail != "" {
@@ -633,21 +651,30 @@ func processLogEntries(c *gin.Context) {
 			}
 			log.Printf("ПРЕВЫШЕНИЕ ЛИМИТА%s: Пользователь %s, IP-адресов: %d/%d", 
 				debugMarker, entry.UserEmail, currentIPCount, userIPLimit)
-			
+
 			// Получаем список всех активных IP
 			var allUserIPs []string
 			for ip := range activeIPs {
 				allUserIPs = append(allUserIPs, ip)
 			}
-			
-			// Отправка команды на блокировку через RabbitMQ
-			if blockingChannel != nil && len(allUserIPs) > 0 {
-				err := publishBlockMessage(allUserIPs)
+
+			// Фильтруем IP-адреса, исключая те, что находятся в списке исключений
+			var ipsToBlock []string
+			for _, ip := range allUserIPs {
+				if excludedIPs[ip] {
+					log.Printf("IP-адрес %s для пользователя %s пропущен, так как находится в списке исключений.", ip, entry.UserEmail)
+					continue
+				}
+				ipsToBlock = append(ipsToBlock, ip)
+			}
+
+			// Отправка команды на блокировку через RabbitMQ только если есть что блокировать
+			if blockingChannel != nil && len(ipsToBlock) > 0 {
+				err := publishBlockMessage(ipsToBlock)
 				if err != nil {
 					log.Printf("Ошибка отправки сообщения о блокировке: %v", err)
 				} else {
-					log.Printf("Сообщение о блокировке для %s%s отправлено", entry.UserEmail, debugMarker)
-					
+					log.Printf("Сообщение о блокировке %d IP-адресов для %s%s отправлено", len(ipsToBlock), entry.UserEmail, debugMarker)
 					// Запускаем отложенную очистку IP с задержкой из конфигурации.
 					go delayedClearUserIPs(entry.UserEmail, clearIPsDelaySeconds)
 				}
