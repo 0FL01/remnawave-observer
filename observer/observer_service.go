@@ -552,49 +552,74 @@ func monitorUserIPPools() {
 }
 
 func publishBlockMessage(ips []string) error {
-	// Блокируем доступ, чтобы только одна горутина могла проверять и переподключаться
+	// Блокируем мьютекс, чтобы предотвратить одновременные попытки переподключения от разных горутин.
 	rabbitMux.Lock()
 	defer rabbitMux.Unlock()
 
-	// Проверяем, живо ли соединение. Если нет - пытаемся переподключиться.
-	if rabbitConn == nil || rabbitConn.IsClosed() {
-		log.Println("Соединение с RabbitMQ потеряно или не установлено. Попытка переподключения...")
-		// Используем нашу функцию с ретраями
-		if err := connectRabbitMQWithRetry(5, 3*time.Second); err != nil {
-			// Если даже с ретраями не получилось, возвращаем ошибку. Сообщение не будет отправлено.
-			return fmt.Errorf("критическая ошибка: не удалось восстановить соединение с RabbitMQ: %w", err)
-		}
-	}
-
-	// Готовим сообщение к отправке
+	// Готовим сообщение один раз перед циклом, чтобы не тратить ресурсы на сериализацию при каждой попытке.
 	blockMsg := BlockMessage{
 		IPs:      ips,
 		Duration: blockDuration,
 	}
 	body, err := json.Marshal(blockMsg)
 	if err != nil {
-		return fmt.Errorf("ошибка сериализации сообщения: %w", err)
+		// Это ошибка кодирования, повторные попытки здесь бессмысленны.
+		return fmt.Errorf("ошибка сериализации сообщения о блокировке: %w", err)
 	}
 
-	// Публикуем сообщение. Канал blockingChannel теперь гарантированно свежий.
-	err = blockingChannel.Publish(
-		blockingExchangeName, // exchange
-		"",                   // routing key
-		false,                // mandatory
-		false,                // immediate
-		amqp091.Publishing{
-			ContentType:  "application/json",
-			Body:         body,
-			DeliveryMode: amqp091.Persistent, // Сообщение переживет перезагрузку RabbitMQ
-		},
-	)
+	// Определяем константы для цикла повторных попыток.
+	const maxPublishRetries = 5
+	const retryDelay = 2 * time.Second
 
-	if err != nil {
-		// Если даже после переподключения отправка не удалась, логируем это как серьезную проблему
-		return fmt.Errorf("ошибка публикации сообщения в RabbitMQ после проверки соединения: %w", err)
+	// Основной цикл повторных попыток публикации.
+	for i := 0; i < maxPublishRetries; i++ {
+		// Перед КАЖДОЙ попыткой проверяем состояние соединения.
+		// Это защищает от сбоев, которые могли произойти во время ожидания (time.Sleep).
+		if rabbitConn == nil || rabbitConn.IsClosed() {
+			log.Println("Соединение с RabbitMQ потеряно или не установлено. Попытка переподключения...")
+			if err := connectRabbitMQWithRetry(3, 2*time.Second); err != nil {
+				// Если переподключение не удалось, логируем и ждем следующей итерации цикла.
+				log.Printf("Не удалось восстановить соединение с RabbitMQ (попытка %d/%d): %v. Повтор через %v", i+1, maxPublishRetries, err, retryDelay)
+				time.Sleep(retryDelay)
+				continue // Переходим к следующей попытке.
+			}
+		}
+
+		// Публикуем сообщение. Канал blockingChannel был обновлен внутри connectRabbitMQWithRetry.
+		err = blockingChannel.Publish(
+			blockingExchangeName, // exchange
+			"",                   // routing key
+			false,                // mandatory
+			false,                // immediate
+			amqp091.Publishing{
+				ContentType:  "application/json",
+				Body:         body,
+				DeliveryMode: amqp091.Persistent, // Сообщение переживет перезагрузку RabbitMQ
+			},
+		)
+
+		// Если публикация прошла успешно, немедленно выходим из функции.
+		if err == nil {
+			return nil
+		}
+
+		// Ошибка! Логируем и готовимся к следующей попытке.
+		log.Printf("Ошибка публикации сообщения в RabbitMQ (попытка %d/%d): %v. Повтор через %v...", i+1, maxPublishRetries, err, retryDelay)
+
+		// Ключевой момент: принудительно закрываем соединение, если оно еще не закрыто.
+		// Это гарантирует, что на следующей итерации будет предпринята попытка создать чистое, новое соединение,
+		// а не использовать 'подвисшее' или полуоткрытое.
+		if rabbitConn != nil {
+			rabbitConn.Close() // Игнорируем ошибку закрытия, так как соединение уже проблемное.
+		}
+
+		// Ждем перед следующей попыткой, чтобы не создавать излишнюю нагрузку.
+		time.Sleep(retryDelay)
 	}
 
-	return nil
+	// Если все попытки исчерпаны, а сообщение так и не отправлено, возвращаем последнюю ошибку.
+	// Это сигнализирует о серьезной и продолжительной проблеме с RabbitMQ.
+	return fmt.Errorf("критическая ошибка: не удалось опубликовать сообщение в RabbitMQ после %d попыток: %w", maxPublishRetries, err)
 }
 
 func sendAlert(payload AlertPayload) error {
