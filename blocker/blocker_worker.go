@@ -194,7 +194,7 @@ func (bw *BlockerWorker) handleConnection() error {
 	msgs, err := ch.Consume(
 		q.Name, // queue
 		"",     // consumer
-		true,   // auto-ack
+		false,  // auto-ack 
 		false,  // exclusive
 		false,  // no-local
 		false,  // no-wait
@@ -216,9 +216,20 @@ func (bw *BlockerWorker) handleConnection() error {
 			if !ok {
 				return fmt.Errorf("канал сообщений закрыт")
 			}
-			
-			if err := bw.processMessage(msg.Body); err != nil {
-				bw.logger.Error(fmt.Sprintf("Произошла непредвиденная ошибка при обработке сообщения: %v", err))
+
+			// Обрабатываем сообщение
+			err := bw.processMessage(msg.Body)
+			if err != nil {
+				bw.logger.Error(fmt.Sprintf("Произошла ошибка при обработке сообщения: %v. Сообщение не будет подтверждено.", err))
+				// Отклоняем сообщение и не ставим его в очередь повторно
+				if errNack := msg.Nack(false, false); errNack != nil {
+					bw.logger.Error(fmt.Sprintf("Ошибка при Nack сообщения: %v", errNack))
+				}
+			} else {
+				// Подтверждаем успешную обработку
+				if errAck := msg.Ack(false); errAck != nil {
+					bw.logger.Error(fmt.Sprintf("Ошибка при Ack сообщения: %v", errAck))
+				}
 			}
 		}
 	}
