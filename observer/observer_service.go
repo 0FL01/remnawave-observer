@@ -67,6 +67,7 @@ var (
 	maxIPsPerUser      int
 	alertWebhookURL    string
 	userIPTTLSeconds   int
+	clearIPsDelaySeconds int
 	alertCooldownSeconds int
 	blockDuration      string
 	blockingExchangeName string
@@ -89,6 +90,7 @@ func init() {
 	alertWebhookURL = getEnv("ALERT_WEBHOOK_URL", "")
 	userIPTTLSeconds = getEnvInt("USER_IP_TTL_SECONDS", 24*60*60)
 	alertCooldownSeconds = getEnvInt("ALERT_COOLDOWN_SECONDS", 60*60)
+	clearIPsDelaySeconds = getEnvInt("CLEAR_IPS_DELAY_SECONDS", 30)
 	blockDuration = getEnv("BLOCK_DURATION", "5m")
 	blockingExchangeName = getEnv("BLOCKING_EXCHANGE_NAME", "blocking_exchange")
 	monitoringInterval = getEnvInt("MONITORING_INTERVAL", 300)
@@ -631,8 +633,8 @@ func processLogEntries(c *gin.Context) {
 				} else {
 					log.Printf("Сообщение о блокировке для %s%s отправлено", entry.UserEmail, debugMarker)
 					
-					// ОТЛОЖЕННАЯ ОЧИСТКА IP-АДРЕСОВ ПОЛЬЗОВАТЕЛЯ
-					go delayedClearUserIPs(entry.UserEmail, 30)
+					// Запускаем отложенную очистку IP с задержкой из конфигурации.
+					go delayedClearUserIPs(entry.UserEmail, clearIPsDelaySeconds)
 				}
 			}
 			
