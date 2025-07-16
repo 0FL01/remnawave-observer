@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -75,9 +74,6 @@ var (
 	monitoringInterval int
 	debugEmail         string
 	debugIPLimit       int
-	
-	// Мьютекс для горутин
-	mu sync.RWMutex
 )
 
 func init() {

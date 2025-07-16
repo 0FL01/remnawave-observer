@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -76,16 +77,20 @@ func NewBlockerWorker() *BlockerWorker {
 }
 
 // runCommand выполняет одну команду nftables
-func (bw *BlockerWorker) runCommand(command string) error {
-	cmd := exec.CommandContext(bw.ctx, "sh", "-c", command)
-	
+func (bw *BlockerWorker) runCommand(args ...string) error {
+	// Первый аргумент - это сама команда, остальные - её параметры
+	cmd := exec.CommandContext(bw.ctx, args[0], args[1:]...)
+
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		bw.logger.Error(fmt.Sprintf("Ошибка выполнения команды '%s': %s", command, string(output)))
+		// Собираем команду в строку только для логирования
+		fullCommand := strings.Join(args, " ")
+		bw.logger.Error(fmt.Sprintf("Ошибка выполнения команды '%s': %s", fullCommand, string(output)))
 		return err
 	}
-	
-	bw.logger.Info(fmt.Sprintf("Команда '%s' выполнена успешно.", command))
+
+	fullCommand := strings.Join(args, " ")
+	bw.logger.Info(fmt.Sprintf("Команда '%s' выполнена успешно.", fullCommand))
 	return nil
 }
 
@@ -108,19 +113,19 @@ func (bw *BlockerWorker) processMessage(body []byte) error {
 		duration = "5m"
 	}
 
-	// Выполняем команды параллельно для всех IP-адресов
 	var wg sync.WaitGroup
 	for _, ip := range payload.IPs {
 		wg.Add(1)
 		go func(ip string) {
 			defer wg.Done()
-			command := fmt.Sprintf("nft add element inet firewall user_blacklist { %s timeout %s }", ip, duration)
-			if err := bw.runCommand(command); err != nil {
+			// Передаем команду и аргументы раздельно, чтобы избежать инъекции
+			err := bw.runCommand("nft", "add", "element", "inet", "firewall", "user_blacklist", "{", ip, "timeout", duration, "}")
+			if err != nil {
 				bw.logger.Error(fmt.Sprintf("Ошибка при обработке IP %s: %v", ip, err))
 			}
 		}(ip)
 	}
-	
+
 	wg.Wait()
 	return nil
 }
