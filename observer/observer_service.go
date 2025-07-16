@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -100,6 +101,7 @@ var (
 	httpClient           *http.Client
 	rabbitConn           *amqp091.Connection
 	blockingChannel      *amqp091.Channel
+	rabbitMux            sync.Mutex
 	excludedUsers        map[string]bool
 	excludedIPs          map[string]bool
 	// Конфигурация из переменных окружения
@@ -211,15 +213,28 @@ func connectRedis() error {
 }
 
 func connectRabbitMQ() error {
+	// Закрываем старое соединение, если оно существует и открыто
+	if rabbitConn != nil && !rabbitConn.IsClosed() {
+		// Канал закроется вместе с соединением
+		if err := rabbitConn.Close(); err != nil {
+			log.Printf("Ошибка при закрытии старого соединения с RabbitMQ: %v", err)
+		}
+	}
+
+	// Устанавливаем новое соединение
 	conn, err := amqp091.Dial(rabbitMQURL)
 	if err != nil {
 		return fmt.Errorf("ошибка подключения к RabbitMQ: %w", err)
 	}
+
+	// Открываем новый канал
 	ch, err := conn.Channel()
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("ошибка создания канала RabbitMQ: %w", err)
 	}
+
+	// Объявляем exchange на новом канале
 	err = ch.ExchangeDeclare(
 		blockingExchangeName, // name
 		"fanout",             // type
@@ -234,9 +249,11 @@ func connectRabbitMQ() error {
 		conn.Close()
 		return fmt.Errorf("ошибка создания exchange: %w", err)
 	}
+
+	// Если все успешно, обновляем глобальные переменные
 	rabbitConn = conn
 	blockingChannel = ch
-	log.Println("Успешное подключение к RabbitMQ")
+	log.Println("Успешное (пере)подключение к RabbitMQ и настройка канала.")
 	return nil
 }
 
@@ -245,8 +262,10 @@ func connectRabbitMQ() error {
 func connectRabbitMQWithRetry(maxRetries int, delay time.Duration) error {
 	var err error
 	for i := 0; i < maxRetries; i++ {
+		// Вызываем нашу обновленную функцию подключения
 		err = connectRabbitMQ()
 		if err == nil {
+			// Успех, выходим
 			return nil
 		}
 		log.Printf("Не удалось подключиться к RabbitMQ (попытка %d/%d): %v. Повтор через %v...", i+1, maxRetries, err, delay)
@@ -533,9 +552,21 @@ func monitorUserIPPools() {
 }
 
 func publishBlockMessage(ips []string) error {
-	if blockingChannel == nil {
-		return fmt.Errorf("RabbitMQ канал не инициализирован")
+	// Блокируем доступ, чтобы только одна горутина могла проверять и переподключаться
+	rabbitMux.Lock()
+	defer rabbitMux.Unlock()
+
+	// Проверяем, живо ли соединение. Если нет - пытаемся переподключиться.
+	if rabbitConn == nil || rabbitConn.IsClosed() {
+		log.Println("Соединение с RabbitMQ потеряно или не установлено. Попытка переподключения...")
+		// Используем нашу функцию с ретраями
+		if err := connectRabbitMQWithRetry(5, 3*time.Second); err != nil {
+			// Если даже с ретраями не получилось, возвращаем ошибку. Сообщение не будет отправлено.
+			return fmt.Errorf("критическая ошибка: не удалось восстановить соединение с RabbitMQ: %w", err)
+		}
 	}
+
+	// Готовим сообщение к отправке
 	blockMsg := BlockMessage{
 		IPs:      ips,
 		Duration: blockDuration,
@@ -544,6 +575,8 @@ func publishBlockMessage(ips []string) error {
 	if err != nil {
 		return fmt.Errorf("ошибка сериализации сообщения: %w", err)
 	}
+
+	// Публикуем сообщение. Канал blockingChannel теперь гарантированно свежий.
 	err = blockingChannel.Publish(
 		blockingExchangeName, // exchange
 		"",                   // routing key
@@ -552,10 +585,16 @@ func publishBlockMessage(ips []string) error {
 		amqp091.Publishing{
 			ContentType:  "application/json",
 			Body:         body,
-			DeliveryMode: amqp091.Persistent,
+			DeliveryMode: amqp091.Persistent, // Сообщение переживет перезагрузку RabbitMQ
 		},
 	)
-	return err
+
+	if err != nil {
+		// Если даже после переподключения отправка не удалась, логируем это как серьезную проблему
+		return fmt.Errorf("ошибка публикации сообщения в RabbitMQ после проверки соединения: %w", err)
+	}
+
+	return nil
 }
 
 func sendAlert(payload AlertPayload) error {
@@ -715,10 +754,10 @@ func main() {
 	const maxRabbitRetries = 10
 	const rabbitRetryDelay = 5 * time.Second
 	if err := connectRabbitMQWithRetry(maxRabbitRetries, rabbitRetryDelay); err != nil {
-		log.Fatalf("Критическая ошибка: не удалось подключиться к RabbitMQ: %v", err)
+		// Логируем фатальную ошибку, если не смогли подключиться при старте
+		log.Fatalf("Критическая ошибка: не удалось подключиться к RabbitMQ при запуске: %v", err)
 	}
-	defer rabbitConn.Close()
-	defer blockingChannel.Close()
+
 	// Запуск мониторинга IP-пулов
 	go monitorUserIPPools()
 	log.Printf("Мониторинг IP-пулов запущен с интервалом %d секунд", monitoringInterval)
