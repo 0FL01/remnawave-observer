@@ -1,7 +1,7 @@
 services:
   observer:
     container_name: observer
-    image: quay.io/0fl01/observer-xray-go:0.0.1
+    image: quay.io/0fl01/observer-xray-go:0.0.2
     restart: unless-stopped
     expose:
       - "9000"
@@ -32,7 +32,7 @@ services:
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
     environment:
-      - RABBITMQ_DEFAULT_USER=chumba
+      - RABBITMQ_DEFAULT_USER=${RABBIT_USER}
       - RABBITMQ_DEFAULT_PASS=${RABBIT_PASSWD}
     networks:
       - observer-net
