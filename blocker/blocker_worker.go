@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,6 +23,10 @@ const (
 	reconnectDelay          = 5 * time.Second
 	logPrefix               = "[BlockerWorker]"
 )
+
+// validDurationPattern - регулярное выражение для безопасной проверки параметра duration.
+// Разрешает только цифры, за которыми следует s, m, h или d.
+var validDurationPattern = regexp.MustCompile(`^\d+[smhd]$`)
 
 // BlockingPayload представляет структуру входящих сообщений
 type BlockingPayload struct {
@@ -113,12 +118,20 @@ func (bw *BlockerWorker) processMessage(body []byte) error {
 		duration = "5m"
 	}
 
+	// Валидируем формат duration перед использованием.
+	if !validDurationPattern.MatchString(duration) {
+		err := fmt.Errorf("недопустимый формат duration, сообщение отклонено: '%s'", duration)
+		bw.logger.Error(err.Error())
+		// Возвращаем ошибку, чтобы сообщение было обработано как некорректное (Nack)
+		return err
+	}
+
 	var wg sync.WaitGroup
 	for _, ip := range payload.IPs {
 		wg.Add(1)
 		go func(ip string) {
 			defer wg.Done()
-			// Передаем команду и аргументы раздельно, чтобы избежать инъекции
+			// Передаем команду и аргументы раздельно, чтобы избежать инъекции.
 			err := bw.runCommand("nft", "add", "element", "inet", "firewall", "user_blacklist", "{", ip, "timeout", duration, "}")
 			if err != nil {
 				bw.logger.Error(fmt.Sprintf("Ошибка при обработке IP %s: %v", ip, err))
