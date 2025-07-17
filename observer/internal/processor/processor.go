@@ -46,8 +46,8 @@ func (p *LogProcessor) StartWorkerPool(ctx context.Context) {
 			for {
 				select {
 				case entries := <-p.logChannel:
-					// Получаем пачку логов из канала и обрабатываем ее
-					p.ProcessEntries(context.Background(), entries)
+					// Это позволяет отменить обработку, если сервис останавливается.
+					p.ProcessEntries(ctx, entries)
 				case <-ctx.Done():
 					// Если контекст завершен (сигнал на остановку), выходим
 					log.Printf("Воркер %d останавливается...", workerID)
@@ -70,7 +70,14 @@ func (p *LogProcessor) EnqueueEntries(entries []models.LogEntry) {
 // ProcessEntries обрабатывает пачку записей логов.
 func (p *LogProcessor) ProcessEntries(ctx context.Context, entries []models.LogEntry) {
 	for _, entry := range entries {
-		p.processSingleEntry(ctx, entry)
+		// Проверяем, не был ли контекст отменен перед обработкой следующей записи
+		select {
+		case <-ctx.Done():
+			log.Printf("Обработка пачки прервана из-за остановки сервиса.")
+			return
+		default:
+			p.processSingleEntry(ctx, entry)
+		}
 	}
 }
 
@@ -84,7 +91,11 @@ func (p *LogProcessor) processSingleEntry(ctx context.Context, entry models.LogE
 
 	res, err := p.storage.CheckAndAddIP(ctx, entry.UserEmail, entry.SourceIP, userIPLimit, p.cfg.UserIPTTL, p.cfg.AlertCooldown)
 	if err != nil {
-		log.Printf("Ошибка обработки записи для %s: %v", entry.UserEmail, err)
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			log.Printf("Операция CheckAndAddIP для %s отменена.", entry.UserEmail)
+		} else {
+			log.Printf("Ошибка обработки записи для %s: %v", entry.UserEmail, err)
+		}
 		return
 	}
 
@@ -93,7 +104,7 @@ func (p *LogProcessor) processSingleEntry(ctx context.Context, entry models.LogE
 			entry.UserEmail, debugMarker, entry.SourceIP, res.CurrentIPCount, userIPLimit)
 	}
 
-	if res.StatusCode == 1 { // Лимит превышен, нужна блокировка
+	if res.StatusCode == 1 { 
 		log.Printf("ПРЕВЫШЕНИЕ ЛИМИТА%s: Пользователь %s, IP-адресов: %d/%d",
 			debugMarker, entry.UserEmail, res.CurrentIPCount, userIPLimit)
 
@@ -104,7 +115,7 @@ func (p *LogProcessor) processSingleEntry(ctx context.Context, entry models.LogE
 				log.Printf("Ошибка отправки сообщения о блокировке: %v", err)
 			} else {
 				log.Printf("Сообщение о блокировке %d IP-адресов для %s%s отправлено", len(ipsToBlock), entry.UserEmail, debugMarker)
-				go p.scheduleIPsClear(entry.UserEmail)
+				go p.scheduleIPsClear(ctx, entry.UserEmail)
 			}
 		}
 
@@ -150,14 +161,28 @@ func (p *LogProcessor) filterExcludedIPs(ips []string, email string) []string {
 	return filtered
 }
 
-func (p *LogProcessor) scheduleIPsClear(userEmail string) {
-	time.Sleep(p.cfg.ClearIPsDelay)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (p *LogProcessor) scheduleIPsClear(parentCtx context.Context, userEmail string) {
+	timer := time.NewTimer(p.cfg.ClearIPsDelay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+	case <-parentCtx.Done():
+		log.Printf("Отложенная очистка IP для %s отменена из-за остановки сервиса.", userEmail)
+		return
+	}
+
+
+	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
 	defer cancel()
 
 	cleared, err := p.storage.ClearUserIPs(ctx, userEmail)
 	if err != nil {
-		log.Printf("Ошибка при отложенной очистке IP для %s: %v", userEmail, err)
+		if err == context.Canceled {
+			log.Printf("Операция очистки IP для %s была отменена.", userEmail)
+		} else {
+			log.Printf("Ошибка при отложенной очистке IP для %s: %v", userEmail, err)
+		}
 		return
 	}
 	log.Printf("Отложенная очистка IP для %s%s выполнена. Очищено ключей: %d",

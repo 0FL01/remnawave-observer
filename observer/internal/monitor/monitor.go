@@ -36,7 +36,7 @@ func (m *PoolMonitor) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			m.performMonitoring(context.Background())
+			m.performMonitoring(ctx)
 		case <-ctx.Done():
 			log.Println("Остановка мониторинга IP-пулов.")
 			return
@@ -45,9 +45,16 @@ func (m *PoolMonitor) Run(ctx context.Context) {
 }
 
 func (m *PoolMonitor) performMonitoring(ctx context.Context) {
-	userEmails, err := m.storage.GetAllUserEmails(ctx)
+	opCtx, cancel := context.WithTimeout(ctx, m.cfg.MonitoringInterval-5*time.Second)
+	defer cancel()
+
+	userEmails, err := m.storage.GetAllUserEmails(opCtx)
 	if err != nil {
-		log.Printf("Ошибка мониторинга (GetAllUserEmails): %v", err)
+		if err == context.Canceled {
+			log.Println("Мониторинг (GetAllUserEmails) отменен из-за остановки сервиса.")
+		} else {
+			log.Printf("Ошибка мониторинга (GetAllUserEmails): %v", err)
+		}
 		return
 	}
 
@@ -62,13 +69,20 @@ func (m *PoolMonitor) performMonitoring(ctx context.Context) {
 
 	var allStats []models.UserIPStats
 	for _, email := range userEmails {
-		stats, err := m.buildUserStats(ctx, email)
-		if err != nil {
-			log.Printf("Ошибка при сборе статистики для %s: %v", email, err)
-			continue
-		}
-		if stats != nil {
-			allStats = append(allStats, *stats)
+		// Проверяем, не отменен ли контекст, перед обработкой следующего пользователя
+		select {
+		case <-opCtx.Done():
+			log.Println("Сбор статистики прерван из-за таймаута или остановки сервиса.")
+			return
+		default:
+			stats, err := m.buildUserStats(opCtx, email)
+			if err != nil {
+				log.Printf("Ошибка при сборе статистики для %s: %v", email, err)
+				continue
+			}
+			if stats != nil {
+				allStats = append(allStats, *stats)
+			}
 		}
 	}
 
