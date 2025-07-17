@@ -34,50 +34,54 @@ func NewLogProcessor(s storage.IPStorage, p publisher.EventPublisher, a alerter.
 
 // StartWorkerPool запускает пул горутин-воркеров для обработки логов.
 // Этот метод должен быть запущен как горутина при старте приложения.
-func (p *LogProcessor) StartWorkerPool(ctx context.Context) {
-	var wg sync.WaitGroup
+func (p *LogProcessor) StartWorkerPool(ctx context.Context, mainWg *sync.WaitGroup) {
+	// Сигнализируем главной горутине о завершении, когда эта функция закончит работу
+	defer mainWg.Done()
+
+	var workerWg sync.WaitGroup
 	log.Printf("Запуск пула воркеров в количестве %d...", p.cfg.WorkerPoolSize)
 
 	for i := 0; i < p.cfg.WorkerPoolSize; i++ {
-		wg.Add(1)
+		workerWg.Add(1)
 		go func(workerID int) {
-			defer wg.Done()
+			defer workerWg.Done()
 			log.Printf("Воркер %d запущен", workerID)
-			for {
-				select {
-				case entries := <-p.logChannel:
-					// Это позволяет отменить обработку, если сервис останавливается.
-					p.ProcessEntries(ctx, entries)
-				case <-ctx.Done():
-					// Если контекст завершен (сигнал на остановку), выходим
-					log.Printf("Воркер %d останавливается...", workerID)
-					return
-				}
+			// Этот цикл будет автоматически завершен, когда logChannel будет закрыт и пуст
+			for entries := range p.logChannel {
+				p.ProcessEntries(context.Background(), entries)
 			}
+			log.Printf("Воркер %d останавливается, так как канал логов закрыт.", workerID)
 		}(i + 1)
 	}
 
-	wg.Wait()
-	log.Println("Все воркеры успешно остановлены.")
+	// Ожидаем сигнала на завершение работы от главного контекста
+	<-ctx.Done()
+	log.Println("Получен сигнал остановки для воркеров. Закрываю канал логов, чтобы обработать оставшиеся сообщения...")
+
+	// Закрываем канал. Это даст понять воркерам в цикле for range, что новых сообщений не будет.
+	close(p.logChannel)
+
+	// Ожидаем, пока все воркеры завершат обработку оставшихся в канале сообщений
+	workerWg.Wait()
+	log.Println("Все воркеры успешно остановили обработку.")
 }
 
 // EnqueueEntries добавляет пачку логов в очередь на обработку.
 // Этот метод вызывается из HTTP-обработчика.
 func (p *LogProcessor) EnqueueEntries(entries []models.LogEntry) {
+	// Добавим проверку, чтобы не писать в закрытый канал
+	defer func() {
+		if r := recover(); r != nil {
+			log.Println("Попытка записи в закрытый канал логов. Сервис находится в процессе остановки.")
+		}
+	}()
 	p.logChannel <- entries
 }
 
 // ProcessEntries обрабатывает пачку записей логов.
 func (p *LogProcessor) ProcessEntries(ctx context.Context, entries []models.LogEntry) {
 	for _, entry := range entries {
-		// Проверяем, не был ли контекст отменен перед обработкой следующей записи
-		select {
-		case <-ctx.Done():
-			log.Printf("Обработка пачки прервана из-за остановки сервиса.")
-			return
-		default:
-			p.processSingleEntry(ctx, entry)
-		}
+		p.processSingleEntry(ctx, entry)
 	}
 }
 
@@ -91,11 +95,7 @@ func (p *LogProcessor) processSingleEntry(ctx context.Context, entry models.LogE
 
 	res, err := p.storage.CheckAndAddIP(ctx, entry.UserEmail, entry.SourceIP, userIPLimit, p.cfg.UserIPTTL, p.cfg.AlertCooldown)
 	if err != nil {
-		if err == context.Canceled || err == context.DeadlineExceeded {
-			log.Printf("Операция CheckAndAddIP для %s отменена.", entry.UserEmail)
-		} else {
-			log.Printf("Ошибка обработки записи для %s: %v", entry.UserEmail, err)
-		}
+		log.Printf("Ошибка обработки записи для %s: %v", entry.UserEmail, err)
 		return
 	}
 
@@ -104,7 +104,7 @@ func (p *LogProcessor) processSingleEntry(ctx context.Context, entry models.LogE
 			entry.UserEmail, debugMarker, entry.SourceIP, res.CurrentIPCount, userIPLimit)
 	}
 
-	if res.StatusCode == 1 { 
+	if res.StatusCode == 1 { // Лимит превышен, нужна блокировка
 		log.Printf("ПРЕВЫШЕНИЕ ЛИМИТА%s: Пользователь %s, IP-адресов: %d/%d",
 			debugMarker, entry.UserEmail, res.CurrentIPCount, userIPLimit)
 
@@ -115,7 +115,7 @@ func (p *LogProcessor) processSingleEntry(ctx context.Context, entry models.LogE
 				log.Printf("Ошибка отправки сообщения о блокировке: %v", err)
 			} else {
 				log.Printf("Сообщение о блокировке %d IP-адресов для %s%s отправлено", len(ipsToBlock), entry.UserEmail, debugMarker)
-				go p.scheduleIPsClear(ctx, entry.UserEmail)
+				go p.scheduleIPsClear(entry.UserEmail)
 			}
 		}
 
@@ -161,28 +161,14 @@ func (p *LogProcessor) filterExcludedIPs(ips []string, email string) []string {
 	return filtered
 }
 
-func (p *LogProcessor) scheduleIPsClear(parentCtx context.Context, userEmail string) {
-	timer := time.NewTimer(p.cfg.ClearIPsDelay)
-	defer timer.Stop()
-
-	select {
-	case <-timer.C:
-	case <-parentCtx.Done():
-		log.Printf("Отложенная очистка IP для %s отменена из-за остановки сервиса.", userEmail)
-		return
-	}
-
-
-	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
+func (p *LogProcessor) scheduleIPsClear(userEmail string) {
+	time.Sleep(p.cfg.ClearIPsDelay)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	cleared, err := p.storage.ClearUserIPs(ctx, userEmail)
 	if err != nil {
-		if err == context.Canceled {
-			log.Printf("Операция очистки IP для %s была отменена.", userEmail)
-		} else {
-			log.Printf("Ошибка при отложенной очистке IP для %s: %v", userEmail, err)
-		}
+		log.Printf("Ошибка при отложенной очистке IP для %s: %v", userEmail, err)
 		return
 	}
 	log.Printf("Отложенная очистка IP для %s%s выполнена. Очищено ключей: %d",

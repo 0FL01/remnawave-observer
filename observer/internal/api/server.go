@@ -11,7 +11,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// Server представляет HTTP-сервер.
 type Server struct {
 	router    *gin.Engine
 	processor *processor.LogProcessor
@@ -19,7 +18,6 @@ type Server struct {
 	port      string
 }
 
-// NewServer создает новый экземпляр сервера.
 func NewServer(port string, proc *processor.LogProcessor, storage storage.IPStorage) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
@@ -37,12 +35,15 @@ func NewServer(port string, proc *processor.LogProcessor, storage storage.IPStor
 	return s
 }
 
+func (s *Server) GetRouter() *gin.Engine {
+	return s.router
+}
+
 func (s *Server) setupRoutes() {
 	s.router.POST("/log-entry", s.handleProcessLogEntries)
 	s.router.GET("/health", s.handleHealthCheck)
 }
 
-// Run запускает HTTP-сервер.
 func (s *Server) Run() error {
 	return s.router.Run(":" + s.port)
 }

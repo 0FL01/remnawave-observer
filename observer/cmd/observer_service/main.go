@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
 	"observer_service/internal/api"
 	"observer_service/internal/config"
@@ -19,13 +22,13 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	// 1. Загрузка конфигурации
 	cfg := config.New()
 
+	// Контекст для сигнализации о завершении работы фоновых процессов
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// WaitGroup для ожидания завершения всех фоновых горутин
+	var wg sync.WaitGroup
 
-	// 2. Инициализация зависимостей (внешних сервисов)
 	redisStore, err := storage.NewRedisStore(ctx, cfg.RedisURL, "internal/scripts/add_and_check_ip.lua")
 	if err != nil {
 		log.Fatalf("Критическая ошибка: не удалось подключиться к Redis: %v", err)
@@ -40,30 +43,45 @@ func main() {
 
 	webhookAlerter := alerter.NewWebhookAlerter(cfg.AlertWebhookURL)
 
-	// 3. Инициализация основных компонентов приложения
 	logProcessor := processor.NewLogProcessor(redisStore, rabbitPublisher, webhookAlerter, cfg)
 	poolMonitor := monitor.NewPoolMonitor(redisStore, cfg)
-	server := api.NewServer(cfg.Port, logProcessor, redisStore)
+	apiServer := api.NewServer(cfg.Port, logProcessor, redisStore)
 
-	// 4. Запуск фоновых процессов
-	go poolMonitor.Run(ctx)
-	// Запускаем пул воркеров для обработки логов
-	go logProcessor.StartWorkerPool(ctx)
+	wg.Add(2) // Сообщаем WaitGroup, что будем ждать две горутины
+	go poolMonitor.Run(ctx, &wg)
+	go logProcessor.StartWorkerPool(ctx, &wg)
 
-	// 5. Запуск API сервера
+	srv := &http.Server{
+		Addr:    ":" + cfg.Port,
+		Handler: apiServer.GetRouter(), // Получаем роутер из нашего api.Server
+	}
+
 	go func() {
 		log.Printf("Сервер Observer Service запущен на порту %s", cfg.Port)
-		if err := server.Run(); err != nil {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Ошибка запуска сервера: %v", err)
 		}
 	}()
 
-	// 6. Ожидание сигнала завершения для graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
 	log.Println("Получен сигнал завершения, начинаю остановку сервиса...")
-	cancel() 
-	log.Println("Сервис успешно остановлен.")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Ошибка при остановке HTTP-сервера: %v", err)
+	} else {
+		log.Println("HTTP-сервер успешно остановлен.")
+	}
+
+	cancel()
+
+	log.Println("Ожидание завершения фоновых процессов...")
+	wg.Wait()
+
+	log.Println("Все фоновые процессы остановлены. Сервис успешно остановлен.")
 }

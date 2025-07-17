@@ -10,6 +10,7 @@ import (
 	"observer_service/internal/services/storage"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,7 +29,10 @@ func NewPoolMonitor(s storage.IPStorage, cfg *config.Config) *PoolMonitor {
 }
 
 // Run запускает бесконечный цикл мониторинга.
-func (m *PoolMonitor) Run(ctx context.Context) {
+func (m *PoolMonitor) Run(ctx context.Context, wg *sync.WaitGroup) {
+	// Гарантируем вызов Done() при выходе из функции
+	defer wg.Done()
+
 	log.Printf("Мониторинг IP-пулов запущен с интервалом %v", m.cfg.MonitoringInterval)
 	ticker := time.NewTicker(m.cfg.MonitoringInterval)
 	defer ticker.Stop()
@@ -36,7 +40,7 @@ func (m *PoolMonitor) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			m.performMonitoring(ctx)
+			m.performMonitoring(context.Background())
 		case <-ctx.Done():
 			log.Println("Остановка мониторинга IP-пулов.")
 			return
@@ -45,16 +49,9 @@ func (m *PoolMonitor) Run(ctx context.Context) {
 }
 
 func (m *PoolMonitor) performMonitoring(ctx context.Context) {
-	opCtx, cancel := context.WithTimeout(ctx, m.cfg.MonitoringInterval-5*time.Second)
-	defer cancel()
-
-	userEmails, err := m.storage.GetAllUserEmails(opCtx)
+	userEmails, err := m.storage.GetAllUserEmails(ctx)
 	if err != nil {
-		if err == context.Canceled {
-			log.Println("Мониторинг (GetAllUserEmails) отменен из-за остановки сервиса.")
-		} else {
-			log.Printf("Ошибка мониторинга (GetAllUserEmails): %v", err)
-		}
+		log.Printf("Ошибка мониторинга (GetAllUserEmails): %v", err)
 		return
 	}
 
@@ -69,20 +66,13 @@ func (m *PoolMonitor) performMonitoring(ctx context.Context) {
 
 	var allStats []models.UserIPStats
 	for _, email := range userEmails {
-		// Проверяем, не отменен ли контекст, перед обработкой следующего пользователя
-		select {
-		case <-opCtx.Done():
-			log.Println("Сбор статистики прерван из-за таймаута или остановки сервиса.")
-			return
-		default:
-			stats, err := m.buildUserStats(opCtx, email)
-			if err != nil {
-				log.Printf("Ошибка при сборе статистики для %s: %v", email, err)
-				continue
-			}
-			if stats != nil {
-				allStats = append(allStats, *stats)
-			}
+		stats, err := m.buildUserStats(ctx, email)
+		if err != nil {
+			log.Printf("Ошибка при сборе статистики для %s: %v", email, err)
+			continue
+		}
+		if stats != nil {
+			allStats = append(allStats, *stats)
 		}
 	}
 
