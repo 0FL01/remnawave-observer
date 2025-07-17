@@ -2,6 +2,7 @@ package processor
 
 import (
 	"context"
+	"errors"
 	"log"
 	"observer_service/internal/config"
 	"observer_service/internal/models"
@@ -68,14 +69,22 @@ func (p *LogProcessor) StartWorkerPool(ctx context.Context, mainWg *sync.WaitGro
 
 // EnqueueEntries добавляет пачку логов в очередь на обработку.
 // Этот метод вызывается из HTTP-обработчика.
-func (p *LogProcessor) EnqueueEntries(entries []models.LogEntry) {
+func (p *LogProcessor) EnqueueEntries(entries []models.LogEntry) error {
 	// Добавим проверку, чтобы не писать в закрытый канал
 	defer func() {
 		if r := recover(); r != nil {
 			log.Println("Попытка записи в закрытый канал логов. Сервис находится в процессе остановки.")
 		}
 	}()
-	p.logChannel <- entries
+
+	select {
+	case p.logChannel <- entries:
+		// Успешно добавлено в очередь
+		return nil
+	default:
+		// Канал полон, запись заблокировалась бы
+		return errors.New("log channel is full, rejecting new entries")
+	}
 }
 
 // ProcessEntries обрабатывает пачку записей логов.

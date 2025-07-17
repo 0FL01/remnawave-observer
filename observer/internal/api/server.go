@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"observer_service/internal/models"
 	"observer_service/internal/processor"
@@ -58,7 +59,13 @@ func (s *Server) handleProcessLogEntries(c *gin.Context) {
 		return
 	}
 
-	s.processor.EnqueueEntries(entries)
+	if err := s.processor.EnqueueEntries(entries); err != nil {
+		log.Printf("Warning: log queue is full. Rejecting request for %d entries. Error: %v", len(entries), err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Service is temporarily overloaded. Please try again later.",
+		})
+		return
+	}
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"status":            "accepted",
