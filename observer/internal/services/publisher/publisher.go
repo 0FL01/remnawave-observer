@@ -2,6 +2,7 @@ package publisher
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"observer_service/internal/models"
@@ -15,17 +16,18 @@ import (
 type EventPublisher interface {
 	PublishBlockMessage(ips []string, duration string) error
 	Close() error
+	Ping() error
 }
 
 // RabbitMQPublisher реализует EventPublisher для RabbitMQ.
 type RabbitMQPublisher struct {
-	conn          *amqp091.Connection
-	channel       *amqp091.Channel
-	exchangeName  string
-	url           string
-	mux           sync.Mutex
-	maxRetries    int
-	retryDelay    time.Duration
+	conn         *amqp091.Connection
+	channel      *amqp091.Channel
+	exchangeName string
+	url          string
+	mux          sync.Mutex
+	maxRetries   int
+	retryDelay   time.Duration
 }
 
 // NewRabbitMQPublisher создает и настраивает нового издателя RabbitMQ.
@@ -138,6 +140,20 @@ func (p *RabbitMQPublisher) PublishBlockMessage(ips []string, duration string) e
 	}
 
 	return fmt.Errorf("критическая ошибка: не удалось опубликовать сообщение в RabbitMQ после %d попыток", p.maxRetries)
+}
+
+// Ping проверяет текущее состояние соединения с RabbitMQ без попытки переподключения.
+func (p *RabbitMQPublisher) Ping() error {
+	p.mux.Lock()
+	defer p.mux.Unlock()
+
+	if p.conn == nil || p.conn.IsClosed() {
+		return errors.New("rabbitmq connection is not active")
+	}
+	if p.channel == nil {
+		return errors.New("rabbitmq channel is not active")
+	}
+	return nil
 }
 
 // Close закрывает соединение с RabbitMQ.

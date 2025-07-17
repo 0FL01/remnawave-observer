@@ -45,7 +45,7 @@ func main() {
 
 	logProcessor := processor.NewLogProcessor(redisStore, rabbitPublisher, webhookAlerter, cfg)
 	poolMonitor := monitor.NewPoolMonitor(redisStore, cfg)
-	apiServer := api.NewServer(cfg.Port, logProcessor, redisStore)
+	apiServer := api.NewServer(cfg.Port, logProcessor, redisStore, rabbitPublisher)
 
 	wg.Add(2) // Сообщаем WaitGroup, что будем ждать две горутины
 	go poolMonitor.Run(ctx, &wg)

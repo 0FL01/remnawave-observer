@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"observer_service/internal/models"
 	"observer_service/internal/processor"
+	"observer_service/internal/services/publisher"
 	"observer_service/internal/services/storage"
 	"time"
 
@@ -15,10 +16,11 @@ type Server struct {
 	router    *gin.Engine
 	processor *processor.LogProcessor
 	storage   storage.IPStorage
+	publisher publisher.EventPublisher
 	port      string
 }
 
-func NewServer(port string, proc *processor.LogProcessor, storage storage.IPStorage) *Server {
+func NewServer(port string, proc *processor.LogProcessor, storage storage.IPStorage, pub publisher.EventPublisher) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 	router.Use(gin.Logger())
@@ -28,6 +30,7 @@ func NewServer(port string, proc *processor.LogProcessor, storage storage.IPStor
 		router:    router,
 		processor: proc,
 		storage:   storage,
+		publisher: pub,
 		port:      port,
 	}
 
@@ -67,17 +70,29 @@ func (s *Server) handleHealthCheck(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := s.storage.Ping(ctx); err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"status":           "error",
-			"redis_connection": "failed",
-			"error":            err.Error(),
-		})
-		return
+	status := http.StatusOK
+	response := gin.H{
+		"redis_connection":    "ok",
+		"rabbitmq_connection": "ok",
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"status":           "ok",
-		"redis_connection": "ok",
-	})
+	// Check Redis
+	if err := s.storage.Ping(ctx); err != nil {
+		status = http.StatusServiceUnavailable
+		response["redis_connection"] = "failed"
+	}
+
+	// Check RabbitMQ
+	if err := s.publisher.Ping(); err != nil {
+		status = http.StatusServiceUnavailable
+		response["rabbitmq_connection"] = "failed"
+	}
+
+	if status == http.StatusOK {
+		response["status"] = "ok"
+	} else {
+		response["status"] = "error"
+	}
+
+	c.JSON(status, response)
 }
