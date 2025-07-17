@@ -8,25 +8,63 @@ import (
 	"observer_service/internal/services/alerter"
 	"observer_service/internal/services/publisher"
 	"observer_service/internal/services/storage"
+	"sync"
 	"time"
 )
 
 // LogProcessor обрабатывает входящие логи.
 type LogProcessor struct {
-	storage   storage.IPStorage
-	publisher publisher.EventPublisher
-	alerter   alerter.Notifier
-	cfg       *config.Config
+	storage    storage.IPStorage
+	publisher  publisher.EventPublisher
+	alerter    alerter.Notifier
+	cfg        *config.Config
+	logChannel chan []models.LogEntry // Канал для получения пачек логов
 }
 
 // NewLogProcessor создает новый экземпляр LogProcessor.
 func NewLogProcessor(s storage.IPStorage, p publisher.EventPublisher, a alerter.Notifier, cfg *config.Config) *LogProcessor {
 	return &LogProcessor{
-		storage:   s,
-		publisher: p,
-		alerter:   a,
-		cfg:       cfg,
+		storage:    s,
+		publisher:  p,
+		alerter:    a,
+		cfg:        cfg,
+		logChannel: make(chan []models.LogEntry, cfg.LogChannelBufferSize),
 	}
+}
+
+// StartWorkerPool запускает пул горутин-воркеров для обработки логов.
+// Этот метод должен быть запущен как горутина при старте приложения.
+func (p *LogProcessor) StartWorkerPool(ctx context.Context) {
+	var wg sync.WaitGroup
+	log.Printf("Запуск пула воркеров в количестве %d...", p.cfg.WorkerPoolSize)
+
+	for i := 0; i < p.cfg.WorkerPoolSize; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			log.Printf("Воркер %d запущен", workerID)
+			for {
+				select {
+				case entries := <-p.logChannel:
+					// Получаем пачку логов из канала и обрабатываем ее
+					p.ProcessEntries(context.Background(), entries)
+				case <-ctx.Done():
+					// Если контекст завершен (сигнал на остановку), выходим
+					log.Printf("Воркер %d останавливается...", workerID)
+					return
+				}
+			}
+		}(i + 1)
+	}
+
+	wg.Wait()
+	log.Println("Все воркеры успешно остановлены.")
+}
+
+// EnqueueEntries добавляет пачку логов в очередь на обработку.
+// Этот метод вызывается из HTTP-обработчика.
+func (p *LogProcessor) EnqueueEntries(entries []models.LogEntry) {
+	p.logChannel <- entries
 }
 
 // ProcessEntries обрабатывает пачку записей логов.

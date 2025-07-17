@@ -25,6 +25,8 @@ type Config struct {
 	DebugIPLimit         int
 	ExcludedUsers        map[string]bool
 	ExcludedIPs          map[string]bool
+	WorkerPoolSize     int
+	LogChannelBufferSize int
 }
 
 // New загружает конфигурацию из переменных окружения.
@@ -45,9 +47,12 @@ func New() *Config {
 		DebugIPLimit:         getEnvInt("DEBUG_IP_LIMIT", 1),
 		ExcludedUsers:        parseSet(getEnv("EXCLUDED_USERS", "")),
 		ExcludedIPs:          parseSet(getEnv("EXCLUDED_IPS", "")),
+		WorkerPoolSize:     getEnvInt("WORKER_POOL_SIZE", 20),
+		LogChannelBufferSize: getEnvInt("LOG_CHANNEL_BUFFER_SIZE", 100),
 	}
 
 	log.Printf("Конфигурация загружена. Порт: %s", cfg.Port)
+	log.Printf("Пул воркеров: %d воркеров, размер буфера канала: %d", cfg.WorkerPoolSize, cfg.LogChannelBufferSize)
 	if len(cfg.ExcludedUsers) > 0 {
 		log.Printf("Загружен список исключений: %d пользователей", len(cfg.ExcludedUsers))
 	}

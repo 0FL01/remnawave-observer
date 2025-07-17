@@ -54,8 +54,7 @@ func (s *Server) handleProcessLogEntries(c *gin.Context) {
 		return
 	}
 
-	// Обработка происходит асинхронно, чтобы быстро ответить клиенту
-	go s.processor.ProcessEntries(context.Background(), entries)
+	s.processor.EnqueueEntries(entries)
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"status":            "accepted",
