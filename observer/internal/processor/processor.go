@@ -173,9 +173,8 @@ func (p *LogProcessor) processSingleEntry(ctx context.Context, entry models.LogE
 				log.Printf("Ошибка отправки сообщения о блокировке: %v", err)
 			} else {
 				log.Printf("Сообщение о блокировке %d IP-адресов для %s%s отправлено", len(ipsToBlock), entry.UserEmail, debugMarker)
-				taskCtx := ctx
 				p.enqueueSideEffectTask(func() {
-					p.scheduleIPsClear(taskCtx, entry.UserEmail)
+					p.scheduleIPsClear(ctx, entry.UserEmail)
 				})
 			}
 		}
@@ -223,30 +222,29 @@ func (p *LogProcessor) filterExcludedIPs(ips []string, email string) []string {
 }
 
 func (p *LogProcessor) scheduleIPsClear(ctx context.Context, userEmail string) {
-	timer := time.NewTimer(p.cfg.ClearIPsDelay)
-	defer timer.Stop()
+	log.Printf("Планирование отложенной очистки IP для %s через %v.", userEmail, p.cfg.ClearIPsDelay)
 
-	select {
-	case <-ctx.Done():
-		log.Printf("Отложенная очистка IP для %s отменена (до таймера) из-за остановки сервиса.", userEmail)
-		return
-	case <-timer.C:
-	}
-
-	opCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	cleared, err := p.storage.ClearUserIPs(opCtx, userEmail)
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			log.Printf("Отложенная очистка IP для %s отменена из-за остановки сервиса во время выполнения.", userEmail)
-		} else if errors.Is(err, context.DeadlineExceeded) {
-			log.Printf("Таймаут при отложенной очистке IP для %s.", userEmail)
-		} else {
-			log.Printf("Ошибка при отложенной очистке IP для %s: %v", userEmail, err)
+	time.AfterFunc(p.cfg.ClearIPsDelay, func() {
+		if ctx.Err() != nil {
+			log.Printf("Отложенная очистка IP для %s отменена из-за остановки сервиса.", userEmail)
+			return
 		}
-		return
-	}
-	log.Printf("Отложенная очистка IP для %s%s выполнена. Очищено ключей: %d",
-		userEmail, p.getDebugMarker(userEmail), cleared)
+
+		opCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		cleared, err := p.storage.ClearUserIPs(opCtx, userEmail)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				log.Printf("Отложенная очистка IP для %s отменена из-за остановки сервиса во время выполнения.", userEmail)
+			} else if errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("Таймаут при отложенной очистке IP для %s.", userEmail)
+			} else {
+				log.Printf("Ошибка при отложенной очистке IP для %s: %v", userEmail, err)
+			}
+			return
+		}
+		log.Printf("Отложенная очистка IP для %s%s выполнена. Очищено ключей: %d",
+			userEmail, p.getDebugMarker(userEmail), cleared)
+	})
 }
