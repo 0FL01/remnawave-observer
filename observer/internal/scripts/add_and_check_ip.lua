@@ -13,6 +13,10 @@ local isNewIp = redis.call('SADD', KEYS[1], ARGV[1])
 local ipTtlKey = 'ip_ttl:' .. string.sub(KEYS[1], 10) .. ':' .. ARGV[1]
 redis.call('SETEX', ipTtlKey, ARGV[2], '1')
 
+-- Обновляем TTL для самого множества IP-адресов пользователя.
+-- Это гарантирует, что множество будет автоматически удалено, если пользователь неактивен.
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+
 -- Получаем текущее количество IP в множестве. Это быстрая операция O(1).
 local currentIpCount = redis.call('SCARD', KEYS[1])
 local ipLimit = tonumber(ARGV[3])

@@ -47,9 +47,11 @@ func main() {
 	poolMonitor := monitor.NewPoolMonitor(redisStore, cfg)
 	apiServer := api.NewServer(cfg.Port, logProcessor, redisStore, rabbitPublisher)
 
-	wg.Add(2) // Сообщаем WaitGroup, что будем ждать две горутины
+	// Сообщаем WaitGroup, что будем ждать три горутины
+	wg.Add(3)
 	go poolMonitor.Run(ctx, &wg)
 	go logProcessor.StartWorkerPool(ctx, &wg)
+	go logProcessor.StartSideEffectWorkerPool(ctx, &wg) // Запускаем новый пул воркеров
 
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
