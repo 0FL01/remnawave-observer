@@ -1,0 +1,27 @@
+services:
+  blocker-xray:
+    container_name: blocker-xray
+    hostname: blocker-xray
+    image: quay.io/0fl01/blocker-xray-go:0.0.2
+    restart: unless-stopped
+    network_mode: host
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "8m"
+        max-file: "5"
+    env_file:
+      - .env
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      - remnanode
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: '0.25'
+        reservations:
+          memory: 32M
+          cpus: '0.10'
