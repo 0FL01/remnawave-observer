@@ -12,6 +12,24 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// Скрипт для атомарной очистки всех ключей пользователя.
+// Он получает все IP из множества пользователя, формирует список всех связанных ключей
+// (само множество и ключи TTL для каждого IP) и удаляет их одной командой DEL.
+// Это гарантирует, что никакие новые IP не "просочатся" между чтением и удалением.
+//
+// KEYS[1]: ключ множества IP пользователя
+// ARGV[1]: префикс для ключей TTL
+const clearUserIPsScript = `
+local ips = redis.call('SMEMBERS', KEYS[1])
+local keysToDelete = { KEYS[1] }
+
+for i, ip in ipairs(ips) do
+    table.insert(keysToDelete, ARGV[1] .. ':' .. ip)
+end
+
+return redis.call('DEL', unpack(keysToDelete))
+`
+
 // IPStorage определяет интерфейс для работы с хранилищем IP-адресов.
 type IPStorage interface {
 	CheckAndAddIP(ctx context.Context, email, ip string, limit int, ttl, cooldown time.Duration) (*models.CheckResult, error)
@@ -25,8 +43,9 @@ type IPStorage interface {
 
 // RedisStore реализует IPStorage с использованием Redis.
 type RedisStore struct {
-	client    *redis.Client
-	scriptSHA string
+	client            *redis.Client
+	addCheckScriptSHA string
+	clearScriptSHA    string
 }
 
 // NewRedisStore создает новый экземпляр RedisStore.
@@ -41,18 +60,28 @@ func NewRedisStore(ctx context.Context, redisURL, scriptPath string) (*RedisStor
 		return nil, fmt.Errorf("ошибка подключения к Redis: %w", err)
 	}
 
-	script, err := os.ReadFile(scriptPath)
+	// Загрузка скрипта проверки и добавления IP из файла
+	addCheckScript, err := os.ReadFile(scriptPath)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка чтения Lua-скрипта '%s': %w", scriptPath, err)
 	}
-
-	scriptSHA, err := client.ScriptLoad(ctx, string(script)).Result()
+	addCheckScriptSHA, err := client.ScriptLoad(ctx, string(addCheckScript)).Result()
 	if err != nil {
-		return nil, fmt.Errorf("ошибка загрузки Lua-скрипта в Redis: %w", err)
+		return nil, fmt.Errorf("ошибка загрузки Lua-скрипта (add/check) в Redis: %w", err)
 	}
 
-	log.Println("Успешное подключение к Redis и загрузка Lua-скрипта.")
-	return &RedisStore{client: client, scriptSHA: scriptSHA}, nil
+	// Загрузка скрипта атомарной очистки из константы
+	clearScriptSHA, err := client.ScriptLoad(ctx, clearUserIPsScript).Result()
+	if err != nil {
+		return nil, fmt.Errorf("ошибка загрузки Lua-скрипта (clear) в Redis: %w", err)
+	}
+
+	log.Println("Успешное подключение к Redis и загрузка Lua-скриптов.")
+	return &RedisStore{
+		client:            client,
+		addCheckScriptSHA: addCheckScriptSHA,
+		clearScriptSHA:    clearScriptSHA,
+	}, nil
 }
 
 // CheckAndAddIP выполняет Lua-скрипт для атомарной проверки и добавления IP.
@@ -67,7 +96,7 @@ func (s *RedisStore) CheckAndAddIP(ctx context.Context, email, ip string, limit 
 		int(cooldown.Seconds()),
 	}
 
-	result, err := s.client.EvalSha(ctx, s.scriptSHA, []string{userIPsSetKey, alertSentKey}, args...).Result()
+	result, err := s.client.EvalSha(ctx, s.addCheckScriptSHA, []string{userIPsSetKey, alertSentKey}, args...).Result()
 	if err != nil {
 		return nil, fmt.Errorf("ошибка выполнения Lua-скрипта для %s: %w", email, err)
 	}
@@ -100,28 +129,21 @@ func (s *RedisStore) CheckAndAddIP(ctx context.Context, email, ip string, limit 
 	return checkResult, nil
 }
 
-// ClearUserIPs удаляет все ключи, связанные с пользователем.
+// ClearUserIPs атомарно удаляет все ключи, связанные с пользователем, используя Lua-скрипт.
 func (s *RedisStore) ClearUserIPs(ctx context.Context, email string) (int, error) {
 	userIpsKey := fmt.Sprintf("user_ips:%s", email)
-	ips, err := s.client.SMembers(ctx, userIpsKey).Result()
+	ipTtlPrefix := fmt.Sprintf("ip_ttl:%s", email)
+
+	// Выполняем Lua-скрипт, который атомарно получает список IP и удаляет все связанные ключи.
+	deleted, err := s.client.EvalSha(ctx, s.clearScriptSHA, []string{userIpsKey}, ipTtlPrefix).Int64()
 	if err != nil {
-		return 0, err
-	}
-	if len(ips) == 0 {
-		return 0, nil
+		// Скрипт DEL не должен возвращать redis.Nil, но на всякий случай проверяем.
+		if err == redis.Nil {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("ошибка выполнения Lua-скрипта (clear) для %s: %w", email, err)
 	}
 
-	keysToDelete := make([]string, 0, len(ips)+1)
-	keysToDelete = append(keysToDelete, userIpsKey)
-	for _, ip := range ips {
-		ipTtlKey := fmt.Sprintf("ip_ttl:%s:%s", email, ip)
-		keysToDelete = append(keysToDelete, ipTtlKey)
-	}
-
-	deleted, err := s.client.Del(ctx, keysToDelete...).Result()
-	if err != nil {
-		return 0, err
-	}
 	return int(deleted), nil
 }
 
@@ -159,7 +181,7 @@ func (s *RedisStore) GetUserActiveIPs(ctx context.Context, userEmail string) (ma
 	return activeIPs, nil
 }
 
-// GetAllUserEmails сканирует ключи Redis для получения всех email пользователей.
+// GetAllUserEmails сканирует ключи Redis для получения всех username (email) пользователей.
 func (s *RedisStore) GetAllUserEmails(ctx context.Context) ([]string, error) {
 	var cursor uint64
 	var emails []string
