@@ -27,7 +27,7 @@ services:
           cpus: '0.10'
 
 
-# Ниже настройки ноды под self steal, но вам главное требуется настроить логирование и vector согласно примеру ниже:
+# Ниже "пример" настройки ноды под self steal, но вам главное требуется настроить логирование и vector согласно примеру ниже:
   remnanode:
     container_name: remnanode
     hostname: remnanode
@@ -42,7 +42,7 @@ services:
     env_file:
       - .env
     volumes:
-      - /dev/shm:/dev/shm:rw
+      - /dev/shm:/dev/shm:rw    
       - /var/log/remnanode:/var/log/remnanode      # <------- Важный параметр, отсюда обсервер берёт метрики по клиентам
 
   vector:
