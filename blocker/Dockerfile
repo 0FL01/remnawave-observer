@@ -7,7 +7,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o blocker-worker .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o blocker-worker ./cmd/blocker_worker
 
 FROM alpine:3.22
 
