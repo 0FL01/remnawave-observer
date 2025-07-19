@@ -87,10 +87,10 @@ Remnawave Observer автоматизирует этот процесс. Он р
 
 1.  Подключитесь к серверу, где будет работать Observer.
 2.  Установите `docker` и `docker-compose`.
-3.  Скопируйте папку `observer-conf` на сервер (например, через `scp` или `git clone`).
+3.  Скопируйте папку `observer_conf` на сервер (например, через `scp` или `git clone`).
     ```bash
     # Пример, если вы клонировали весь репозиторий:
-    cd remnawave-observer-main/observer-conf
+    cd *repo*/observer_conf
     ```
 4.  Создайте и отредактируйте файл с переменными окружения:
     ```bash
@@ -99,9 +99,11 @@ Remnawave Observer автоматизирует этот процесс. Он р
     ```
     Заполните переменные:
     *   `MAX_IPS_PER_USER`: Рекомендуемое значение **12** или выше. Это позволяет пользователям без проблем переключаться между домашним Wi-Fi, мобильным интернетом (LTE), рабочим Wi-Fi и т.д.
-    *   `ALERT_WEBHOOK_URL`: URL для отправки уведомлений (например, в Telegram).
-    *   `EXCLUDED_USERS`: Email-адреса пользователей через запятую, которых не нужно проверять (например, `user1@example.com,user2@example.com`).
+    *   `ALERT_WEBHOOK_URL`: URL для отправки уведомлений (например, в Telegram shop bot).
+    *   `EXCLUDED_USERS`: Username пользователей через запятую, которых не нужно проверять (например, `self,13_12143423`).
     *   `EXCLUDED_IPS`: **ВАЖНО!** IP-адреса, которые никогда не будут заблокированы. Укажите здесь IP-адреса всех ваших нод и сервера Observer, чтобы избежать случайной блокировки (например, `8.8.8.8,1.1.1.1,192.168.1.1`).
+    *   `USER_IP_TTL_SECONDS`: Укажите TTL, Как долго будет жить "отпечаток" ип адреса юзера, до того как будет удалён из редис, (Рекомендую 86400, т.е 1 час)
+    *   `CLEAR_IPS_DELAY_SECONDS`: Таймаут хранения отпечатка ип адреса в редис, после применения блокировки юзера (Рекомендую 30 секунд)
     *   `RABBIT_USER`, `RABBIT_PASSWD`: Создайте надежные логин и пароль для RabbitMQ.
     *   `RABBITMQ_URL`: Сформируйте URL для **внутреннего** использования сервисом Observer. Пример: `amqp://myuser:mypassword@rabbitmq:5672/`.
 
@@ -312,7 +314,7 @@ Remnawave Observer не только блокирует нарушителей, 
 
 **Шаг 2: Настройте Observer**
 
-В файле `observer-conf/.env` на вашем сервере Observer укажите URL из предыдущего шага:
+В файле `observer_conf/.env` на вашем сервере Observer укажите URL из предыдущего шага:
 ```
 ALERT_WEBHOOK_URL=https://bot.yourdomain.com/webhook/alert
 ```
@@ -356,7 +358,7 @@ ALERT_WEBHOOK_URL=https://bot.yourdomain.com/webhook/alert
 1.  **Терминирование SSL**: Принимает зашифрованный трафик от нод, расшифровывает его с помощью вашего SSL-сертификата.
 2.  **Проксирование**: Передает уже расшифрованный, "чистый" HTTP-трафик на сервис `vector-aggregator`, который работает внутри Docker-сети и не доступен извне напрямую.
 
-##### 1. Конфигурация docker compose (`observer-conf/docker-compose.yml`)
+##### 1. Конфигурация docker compose (`observer_conf/docker-compose.yml`)
 
 ```yml
 services:
@@ -472,7 +474,7 @@ volumes:
   rabbitmq-obs-data:
 ```
 
-##### 2. Конфигурация Nginx (`observer-conf/nginx.conf`)
+##### 2. Конфигурация Nginx (`observer_conf/nginx.conf`)
 
 ```nginx
 user nginx;
@@ -580,7 +582,7 @@ http {
 }
 ```
 
-##### 3. Конфигурация Vector-агрегатора (`observer-conf/vector.toml`)
+##### 3. Конфигурация Vector-агрегатора (`observer_conf/vector.toml`)
 
 Этот Vector работает как приемник данных от Nginx и передатчик для основного сервиса `observer`.
 
@@ -658,3 +660,18 @@ http {
 
   [sinks.central_observer_api.tls]
 ```
+
+
+---
+
+## Связь с автором
+
+Если у вас возникли вопросы, предложения по улучшению или вы нашли ошибку в работе модуля, вы можете связаться со мной напрямую.
+
+Я открыт для обсуждения:
+- Вопросов по установке и настройке.
+- Предложений по новому функционалу.
+- Сообщений о багах и ошибках.
+- Вопросов сотрудничества.
+
+[![Telegram](https://img.shields.io/badge/Telegram-OFL01-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/OFL01)
