@@ -234,8 +234,8 @@ func (p *LogProcessor) processEntryBySubnet(ctx context.Context, entry models.Lo
 		log.Printf("ПРЕВЫШЕНИЕ ЛИМИТА ПОДСЕТЕЙ%s: Пользователь %s, подсетей: %d/%d",
 			debugMarker, entry.UserEmail, res.CurrentCount, userSubnetLimit)
 
-		// В режиме подсетей исключения не применяются, блокируем всю подсеть
-		subnetsToBlock := res.AllUserItems
+		// Фильтруем подсети из белого списка перед блокировкой
+		subnetsToBlock := p.filterExcludedSubnets(res.AllUserItems, entry.UserEmail)
 
 		if len(subnetsToBlock) > 0 {
 			if err := p.publisher.PublishBlockMessage(subnetsToBlock, p.cfg.BlockDuration); err != nil {
@@ -252,7 +252,7 @@ func (p *LogProcessor) processEntryBySubnet(ctx context.Context, entry models.Lo
 			UserIdentifier:   entry.UserEmail,
 			DetectedIPsCount: int(res.CurrentCount),
 			Limit:            userSubnetLimit,
-			AllUserIPs:       res.AllUserItems,
+			AllUserIPs:       res.AllUserItems, // В алерт отправляем все подсети, даже исключенные
 			BlockDuration:    p.cfg.BlockDuration,
 			ViolationType:    "subnet_limit_exceeded",
 		}
@@ -286,6 +286,22 @@ func (p *LogProcessor) filterExcludedIPs(ips []string, email string) []string {
 			continue
 		}
 		filtered = append(filtered, ip)
+	}
+	return filtered
+}
+
+// filterExcludedSubnets проверяет список подсетей на наличие в белом списке.
+func (p *LogProcessor) filterExcludedSubnets(subnets []string, email string) []string {
+	if len(p.cfg.ExcludedSubnets) == 0 {
+		return subnets
+	}
+	var filtered []string
+	for _, subnet := range subnets {
+		if p.cfg.ExcludedSubnets[subnet] {
+			log.Printf("Подсеть %s для пользователя %s пропущена, так как находится в списке исключений.", subnet, email)
+			continue
+		}
+		filtered = append(filtered, subnet)
 	}
 	return filtered
 }

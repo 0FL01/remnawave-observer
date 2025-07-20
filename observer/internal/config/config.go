@@ -30,11 +30,12 @@ type Config struct {
 	SideEffectWorkerPoolSize    int
 	SideEffectChannelBufferSize int
 
-	// ПАРАМЕТРЫ ДЛЯ РЕЖИМА ПОДСЕТЕЙ ---
+	// --- ПАРАМЕТРЫ ДЛЯ РЕЖИМА ПОДСЕТЕЙ ---
 	DetectBySubnet    bool          // Включить режим детекции по подсетям
-	MaxSubnetsPerUser int           // Лимит подсетей на пользователя
-	UserSubnetTTL     time.Duration // TTL для подсети пользователя
-	SubnetMaskIPv4    int           // Маска для IPv4 подсетей (например, 24 для /24)
+	MaxSubnetsPerUser int           
+	UserSubnetTTL     time.Duration 
+	SubnetMaskIPv4    int           
+	ExcludedSubnets   map[string]bool 
 }
 
 // New загружает конфигурацию из переменных окружения.
@@ -60,11 +61,12 @@ func New() *Config {
 		SideEffectWorkerPoolSize:    getEnvInt("SIDE_EFFECT_WORKER_POOL_SIZE", 10),
 		SideEffectChannelBufferSize: getEnvInt("SIDE_EFFECT_CHANNEL_BUFFER_SIZE", 50),
 
-		// --- Загрузка новых параметров ---
+		// --- Загрузка параметров подсетей ---
 		DetectBySubnet:    getEnvBool("DETECT_BY_SUBNET", false),
 		MaxSubnetsPerUser: getEnvInt("MAX_SUBNETS_PER_USER", 3),
 		UserSubnetTTL:     time.Duration(getEnvInt("USER_SUBNET_TTL_SECONDS", 86400)) * time.Second,
 		SubnetMaskIPv4:    getEnvInt("SUBNET_MASK_IPV4", 24),
+		ExcludedSubnets:   parseSet(getEnv("EXCLUDED_SUBNETS", "")), // <-- НОВОЕ
 	}
 
 	log.Printf("Конфигурация загружена. Порт: %s", cfg.Port)
@@ -80,6 +82,9 @@ func New() *Config {
 	}
 	if len(cfg.ExcludedIPs) > 0 {
 		log.Printf("Загружен список исключений IP-адресов: %d", len(cfg.ExcludedIPs))
+	}
+	if len(cfg.ExcludedSubnets) > 0 {
+		log.Printf("Загружен список исключений подсетей: %d", len(cfg.ExcludedSubnets))
 	}
 	if cfg.DebugEmail != "" {
 		log.Printf("Режим дебага включен для email: %s с лимитом IP: %d", cfg.DebugEmail, cfg.DebugIPLimit)
