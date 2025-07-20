@@ -16,5 +16,6 @@ WORKDIR /app
 COPY --from=builder /app/observer_service .
 
 COPY --from=builder /app/internal/scripts/add_and_check_ip.lua ./internal/scripts/add_and_check_ip.lua
+COPY --from=builder /app/internal/scripts/add_and_check_subnet.lua ./internal/scripts/add_and_check_subnet.lua
 
 CMD ["/app/observer_service"]

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
 	"observer_service/internal/config"
 	"observer_service/internal/models"
 	"observer_service/internal/services/alerter"
@@ -74,7 +75,6 @@ func (p *LogProcessor) StartSideEffectWorkerPool(ctx context.Context, mainWg *sy
 			defer workerWg.Done()
 			log.Printf("Воркер побочных задач %d запущен", workerID)
 			for task := range p.sideEffectChannel {
-				// Проверяем, не был ли контекст отменен перед выполнением задачи
 				select {
 				case <-ctx.Done():
 					log.Printf("Воркер побочных задач %d пропустил задачу из-за отмены контекста.", workerID)
@@ -143,12 +143,19 @@ func (p *LogProcessor) processSingleEntry(ctx context.Context, entry models.LogE
 		return // Пользователь в списке исключений
 	}
 
+	if p.cfg.DetectBySubnet {
+		p.processEntryBySubnet(ctx, entry)
+	} else {
+		p.processEntryByIP(ctx, entry)
+	}
+}
+
+func (p *LogProcessor) processEntryByIP(ctx context.Context, entry models.LogEntry) {
 	userIPLimit := p.getUserIPLimit(entry.UserEmail)
 	debugMarker := p.getDebugMarker(entry.UserEmail)
 
 	res, err := p.storage.CheckAndAddIP(ctx, entry.UserEmail, entry.SourceIP, userIPLimit, p.cfg.UserIPTTL, p.cfg.AlertCooldown)
 	if err != nil {
-		// Проверяем, не была ли ошибка вызвана отменой контекста
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			log.Printf("Операция CheckAndAddIP отменена для %s: %v", entry.UserEmail, err)
 		} else {
@@ -157,16 +164,16 @@ func (p *LogProcessor) processSingleEntry(ctx context.Context, entry models.LogE
 		return
 	}
 
-	if res.StatusCode == 0 && res.IsNewIP {
+	if res.StatusCode == 0 && res.IsNew {
 		log.Printf("Новый IP для пользователя %s%s: %s. Всего IP: %d/%d",
-			entry.UserEmail, debugMarker, entry.SourceIP, res.CurrentIPCount, userIPLimit)
+			entry.UserEmail, debugMarker, entry.SourceIP, res.CurrentCount, userIPLimit)
 	}
 
 	if res.StatusCode == 1 { // Лимит превышен, нужна блокировка
-		log.Printf("ПРЕВЫШЕНИЕ ЛИМИТА%s: Пользователь %s, IP-адресов: %d/%d",
-			debugMarker, entry.UserEmail, res.CurrentIPCount, userIPLimit)
+		log.Printf("ПРЕВЫШЕНИЕ ЛИМИТА IP%s: Пользователь %s, IP-адресов: %d/%d",
+			debugMarker, entry.UserEmail, res.CurrentCount, userIPLimit)
 
-		ipsToBlock := p.filterExcludedIPs(res.AllUserIPs, entry.UserEmail)
+		ipsToBlock := p.filterExcludedIPs(res.AllUserItems, entry.UserEmail)
 
 		if len(ipsToBlock) > 0 {
 			if err := p.publisher.PublishBlockMessage(ipsToBlock, p.cfg.BlockDuration); err != nil {
@@ -181,11 +188,73 @@ func (p *LogProcessor) processSingleEntry(ctx context.Context, entry models.LogE
 
 		alertPayload := models.AlertPayload{
 			UserIdentifier:   entry.UserEmail,
-			DetectedIPsCount: int(res.CurrentIPCount),
+			DetectedIPsCount: int(res.CurrentCount),
 			Limit:            userIPLimit,
-			AllUserIPs:       res.AllUserIPs,
+			AllUserIPs:       res.AllUserItems,
 			BlockDuration:    p.cfg.BlockDuration,
 			ViolationType:    "ip_limit_exceeded",
+		}
+		p.enqueueSideEffectTask(func() {
+			if err := p.alerter.SendAlert(alertPayload); err != nil {
+				log.Printf("Ошибка отправки вебхук-уведомления: %v", err)
+			}
+		})
+	}
+}
+
+func (p *LogProcessor) processEntryBySubnet(ctx context.Context, entry models.LogEntry) {
+	ip := net.ParseIP(entry.SourceIP)
+	if ip == nil || ip.To4() == nil {
+		return // Игнорируем невалидные или не-IPv4 адреса
+	}
+
+	mask := net.CIDRMask(p.cfg.SubnetMaskIPv4, 32)
+	subnet := &net.IPNet{IP: ip.Mask(mask), Mask: mask}
+	subnetStr := subnet.String()
+
+	userSubnetLimit := p.cfg.MaxSubnetsPerUser
+	debugMarker := p.getDebugMarker(entry.UserEmail)
+
+	res, err := p.storage.CheckAndAddSubnet(ctx, entry.UserEmail, subnetStr, userSubnetLimit, p.cfg.UserSubnetTTL, p.cfg.AlertCooldown)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("Операция CheckAndAddSubnet отменена для %s: %v", entry.UserEmail, err)
+		} else {
+			log.Printf("Ошибка обработки записи (Subnet) для %s: %v", entry.UserEmail, err)
+		}
+		return
+	}
+
+	if res.StatusCode == 0 && res.IsNew {
+		log.Printf("Новая подсеть для пользователя %s%s: %s. Всего подсетей: %d/%d",
+			entry.UserEmail, debugMarker, subnetStr, res.CurrentCount, userSubnetLimit)
+	}
+
+	if res.StatusCode == 1 { // Лимит превышен, нужна блокировка
+		log.Printf("ПРЕВЫШЕНИЕ ЛИМИТА ПОДСЕТЕЙ%s: Пользователь %s, подсетей: %d/%d",
+			debugMarker, entry.UserEmail, res.CurrentCount, userSubnetLimit)
+
+		// В режиме подсетей исключения не применяются, блокируем всю подсеть
+		subnetsToBlock := res.AllUserItems
+
+		if len(subnetsToBlock) > 0 {
+			if err := p.publisher.PublishBlockMessage(subnetsToBlock, p.cfg.BlockDuration); err != nil {
+				log.Printf("Ошибка отправки сообщения о блокировке подсетей: %v", err)
+			} else {
+				log.Printf("Сообщение о блокировке %d подсетей для %s%s отправлено", len(subnetsToBlock), entry.UserEmail, debugMarker)
+				p.enqueueSideEffectTask(func() {
+					p.scheduleSubnetsClear(ctx, entry.UserEmail)
+				})
+			}
+		}
+
+		alertPayload := models.AlertPayload{
+			UserIdentifier:   entry.UserEmail,
+			DetectedIPsCount: int(res.CurrentCount),
+			Limit:            userSubnetLimit,
+			AllUserIPs:       res.AllUserItems,
+			BlockDuration:    p.cfg.BlockDuration,
+			ViolationType:    "subnet_limit_exceeded",
 		}
 		p.enqueueSideEffectTask(func() {
 			if err := p.alerter.SendAlert(alertPayload); err != nil {
@@ -245,6 +314,34 @@ func (p *LogProcessor) scheduleIPsClear(ctx context.Context, userEmail string) {
 			return
 		}
 		log.Printf("Отложенная очистка IP для %s%s выполнена. Очищено ключей: %d",
+			userEmail, p.getDebugMarker(userEmail), cleared)
+	})
+}
+
+func (p *LogProcessor) scheduleSubnetsClear(ctx context.Context, userEmail string) {
+	log.Printf("Планирование отложенной очистки ПОДСЕТЕЙ для %s через %v.", userEmail, p.cfg.ClearIPsDelay)
+
+	time.AfterFunc(p.cfg.ClearIPsDelay, func() {
+		if ctx.Err() != nil {
+			log.Printf("Отложенная очистка ПОДСЕТЕЙ для %s отменена из-за остановки сервиса.", userEmail)
+			return
+		}
+
+		opCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		cleared, err := p.storage.ClearUserSubnets(opCtx, userEmail)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				log.Printf("Отложенная очистка ПОДСЕТЕЙ для %s отменена из-за остановки сервиса во время выполнения.", userEmail)
+			} else if errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("Таймаут при отложенной очистке ПОДСЕТЕЙ для %s.", userEmail)
+			} else {
+				log.Printf("Ошибка при отложенной очистке ПОДСЕТЕЙ для %s: %v", userEmail, err)
+			}
+			return
+		}
+		log.Printf("Отложенная очистка ПОДСЕТЕЙ для %s%s выполнена. Очищено ключей: %d",
 			userEmail, p.getDebugMarker(userEmail), cleared)
 	})
 }
