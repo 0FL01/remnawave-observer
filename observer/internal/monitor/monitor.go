@@ -32,17 +32,15 @@ func NewPoolMonitor(s storage.IPStorage, cfg *config.Config) *PoolMonitor {
 func (m *PoolMonitor) Run(ctx context.Context, wg *sync.WaitGroup) {
 	// Гарантируем вызов Done() при выходе из функции
 	defer wg.Done()
-
-	log.Printf("Мониторинг IP-пулов запущен с интервалом %v", m.cfg.MonitoringInterval)
+	log.Printf("Мониторинг пулов запущен с интервалом %v", m.cfg.MonitoringInterval)
 	ticker := time.NewTicker(m.cfg.MonitoringInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ticker.C:
 			m.performMonitoring(context.Background())
 		case <-ctx.Done():
-			log.Println("Остановка мониторинга IP-пулов.")
+			log.Println("Остановка мониторинга пулов.")
 			return
 		}
 	}
@@ -54,16 +52,14 @@ func (m *PoolMonitor) performMonitoring(ctx context.Context) {
 		log.Printf("Ошибка мониторинга (GetAllUserEmails): %v", err)
 		return
 	}
-
 	now := time.Now().Format("2006-01-02 15:04:05")
+	modeName := m.getMonitoringModeName()
 	if len(userEmails) == 0 {
-		fmt.Printf("[%s] === IP POOLS MONITORING === НЕТ АКТИВНЫХ ПОЛЬЗОВАТЕЛЕЙ\n", now)
+		fmt.Printf("[%s] === %s MONITORING === НЕТ АКТИВНЫХ ПОЛЬЗОВАТЕЛЕЙ\n", now, modeName)
 		return
 	}
-
-	fmt.Printf("\n[%s] === IP POOLS MONITORING START ===\n", now)
-	defer fmt.Printf("[%s] === IP POOLS MONITORING END ===\n\n", time.Now().Format("2006-01-02 15:04:05"))
-
+	fmt.Printf("\n[%s] === %s MONITORING START ===\n", now, modeName)
+	defer fmt.Printf("[%s] === %s MONITORING END ===\n\n", time.Now().Format("2006-01-02 15:04:05"), modeName)
 	var allStats []models.UserIPStats
 	for _, email := range userEmails {
 		stats, err := m.buildUserStats(ctx, email)
@@ -75,17 +71,29 @@ func (m *PoolMonitor) performMonitoring(ctx context.Context) {
 			allStats = append(allStats, *stats)
 		}
 	}
-
 	sort.Slice(allStats, func(i, j int) bool {
 		return allStats[i].IPCount > allStats[j].IPCount
 	})
-
 	m.printSummary(allStats)
 	m.printTopUsers(allStats)
 	m.printOverLimitUsers(allStats)
 }
 
+func (m *PoolMonitor) getMonitoringModeName() string {
+	if m.cfg.DetectBySubnet {
+		return "SUBNET POOLS"
+	}
+	return "IP POOLS"
+}
+
 func (m *PoolMonitor) buildUserStats(ctx context.Context, email string) (*models.UserIPStats, error) {
+	if m.cfg.DetectBySubnet {
+		return m.buildUserStatsBySubnet(ctx, email)
+	}
+	return m.buildUserStatsByIP(ctx, email)
+}
+
+func (m *PoolMonitor) buildUserStatsByIP(ctx context.Context, email string) (*models.UserIPStats, error) {
 	activeIPs, err := m.storage.GetUserActiveIPs(ctx, email)
 	if err != nil {
 		return nil, err
@@ -93,8 +101,7 @@ func (m *PoolMonitor) buildUserStats(ctx context.Context, email string) (*models
 	if len(activeIPs) == 0 {
 		return nil, nil
 	}
-
-	userLimit := m.getUserIPLimit(email)
+	userLimit := m.getUserLimit(email)
 	ipCount := len(activeIPs)
 	status := "NORMAL"
 	if float64(ipCount) >= float64(userLimit)*0.8 {
@@ -103,9 +110,7 @@ func (m *PoolMonitor) buildUserStats(ctx context.Context, email string) (*models
 	if ipCount > userLimit {
 		status = "OVER_LIMIT"
 	}
-
 	hasCooldown, _ := m.storage.HasAlertCooldown(ctx, email)
-
 	var ips, ipsWithTTL []string
 	var ttlValues []int
 	for ip, ttl := range activeIPs {
@@ -115,20 +120,66 @@ func (m *PoolMonitor) buildUserStats(ctx context.Context, email string) (*models
 	}
 	sort.Strings(ips)
 	sort.Strings(ipsWithTTL)
-
 	minTTL, maxTTL := 0.0, 0.0
 	if len(ttlValues) > 0 {
 		sort.Ints(ttlValues)
 		minTTL = float64(ttlValues[0]) / 3600.0
 		maxTTL = float64(ttlValues[len(ttlValues)-1]) / 3600.0
 	}
-
 	return &models.UserIPStats{
 		Email:            email,
 		IPCount:          ipCount,
 		Limit:            userLimit,
 		IPs:              ips,
 		IPsWithTTL:       ipsWithTTL,
+		MinTTLHours:      math.Round(minTTL*10) / 10,
+		MaxTTLHours:      math.Round(maxTTL*10) / 10,
+		Status:           status,
+		HasAlertCooldown: hasCooldown,
+		IsExcluded:       m.cfg.ExcludedUsers[email],
+		IsDebug:          m.cfg.DebugEmail != "" && email == m.cfg.DebugEmail,
+	}, nil
+}
+
+func (m *PoolMonitor) buildUserStatsBySubnet(ctx context.Context, email string) (*models.UserIPStats, error) {
+	activeSubnets, err := m.storage.GetUserActiveSubnets(ctx, email)
+	if err != nil {
+		return nil, err
+	}
+	if len(activeSubnets) == 0 {
+		return nil, nil
+	}
+	userLimit := m.getUserLimit(email)
+	itemCount := len(activeSubnets)
+	status := "NORMAL"
+	if float64(itemCount) >= float64(userLimit)*0.8 {
+		status = "NEAR_LIMIT"
+	}
+	if itemCount > userLimit {
+		status = "OVER_LIMIT"
+	}
+	hasCooldown, _ := m.storage.HasAlertCooldown(ctx, email)
+	var items, itemsWithTTL []string
+	var ttlValues []int
+	for item, ttl := range activeSubnets {
+		items = append(items, item)
+		itemsWithTTL = append(itemsWithTTL, fmt.Sprintf("%s(%.1fh)", item, float64(ttl)/3600.0))
+		ttlValues = append(ttlValues, ttl)
+	}
+	sort.Strings(items)
+	sort.Strings(itemsWithTTL)
+	minTTL, maxTTL := 0.0, 0.0
+	if len(ttlValues) > 0 {
+		sort.Ints(ttlValues)
+		minTTL = float64(ttlValues[0]) / 3600.0
+		maxTTL = float64(ttlValues[len(ttlValues)-1]) / 3600.0
+	}
+	return &models.UserIPStats{
+		Email:            email,
+		IPCount:          itemCount,
+		Limit:            userLimit,
+		IPs:              items,
+		IPsWithTTL:       itemsWithTTL,
 		MinTTLHours:      math.Round(minTTL*10) / 10,
 		MaxTTLHours:      math.Round(maxTTL*10) / 10,
 		Status:           status,
@@ -166,7 +217,17 @@ func (m *PoolMonitor) printSummary(stats []models.UserIPStats) {
 }
 
 func (m *PoolMonitor) printTopUsers(stats []models.UserIPStats) {
-	fmt.Println("\n📈 ТОП ПОЛЬЗОВАТЕЛИ ПО КОЛИЧЕСТВУ IP:")
+	var title, itemLabel, itemsLabel string
+	if m.cfg.DetectBySubnet {
+		title = "📈 ТОП ПОЛЬЗОВАТЕЛИ ПО КОЛИЧЕСТВУ ПОДСЕТЕЙ:"
+		itemLabel = "Подсети"
+		itemsLabel = "Подсети"
+	} else {
+		title = "📈 ТОП ПОЛЬЗОВАТЕЛИ ПО КОЛИЧЕСТВУ IP:"
+		itemLabel = "IP"
+		itemsLabel = "IPs"
+	}
+	fmt.Println("\n" + title)
 	limit := 10
 	if len(stats) < limit {
 		limit = len(stats)
@@ -174,8 +235,8 @@ func (m *PoolMonitor) printTopUsers(stats []models.UserIPStats) {
 	for i := 0; i < limit; i++ {
 		user := stats[i]
 		fmt.Printf("   %2d. %s %s%s\n", i+1, getStatusEmoji(user.Status), user.Email, getMarkers(user))
-		fmt.Printf("       IP: %d/%d | TTL: %.1f-%.1fh\n", user.IPCount, user.Limit, user.MinTTLHours, user.MaxTTLHours)
-		fmt.Printf("       IPs: %s\n", strings.Join(user.IPsWithTTL, ", "))
+		fmt.Printf("       %s: %d/%d | TTL: %.1f-%.1fh\n", itemLabel, user.IPCount, user.Limit, user.MinTTLHours, user.MaxTTLHours)
+		fmt.Printf("       %s: %s\n", itemsLabel, strings.Join(user.IPsWithTTL, ", "))
 	}
 }
 
@@ -187,18 +248,29 @@ func (m *PoolMonitor) printOverLimitUsers(stats []models.UserIPStats) {
 		}
 	}
 	if len(overLimitUsers) > 0 {
+		var itemLabel, itemsLabel string
+		if m.cfg.DetectBySubnet {
+			itemLabel = "Подсети"
+			itemsLabel = "Подсети"
+		} else {
+			itemLabel = "IP"
+			itemsLabel = "IPs"
+		}
 		fmt.Println("\n🚨 ПОЛЬЗОВАТЕЛИ С ПРЕВЫШЕНИЕМ ЛИМИТА:")
 		for _, user := range overLimitUsers {
 			fmt.Printf("   • %s%s\n", user.Email, getMarkers(user))
-			fmt.Printf("     IP: %d/%d | TTL: %.1f-%.1fh\n", user.IPCount, user.Limit, user.MinTTLHours, user.MaxTTLHours)
-			fmt.Printf("     IPs: %s\n", strings.Join(user.IPsWithTTL, ", "))
+			fmt.Printf("     %s: %d/%d | TTL: %.1f-%.1fh\n", itemLabel, user.IPCount, user.Limit, user.MinTTLHours, user.MaxTTLHours)
+			fmt.Printf("     %s: %s\n", itemsLabel, strings.Join(user.IPsWithTTL, ", "))
 		}
 	}
 }
 
-func (m *PoolMonitor) getUserIPLimit(userEmail string) int {
+func (m *PoolMonitor) getUserLimit(userEmail string) int {
 	if m.cfg.DebugEmail != "" && userEmail == m.cfg.DebugEmail {
 		return m.cfg.DebugIPLimit
+	}
+	if m.cfg.DetectBySubnet {
+		return m.cfg.MaxSubnetsPerUser
 	}
 	return m.cfg.MaxIPsPerUser
 }

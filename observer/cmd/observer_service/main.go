@@ -29,7 +29,7 @@ func main() {
 	// WaitGroup для ожидания завершения всех фоновых горутин
 	var wg sync.WaitGroup
 
-	redisStore, err := storage.NewRedisStore(ctx, cfg.RedisURL, "internal/scripts/add_and_check_ip.lua")
+	redisStore, err := storage.NewRedisStore(ctx, cfg.RedisURL)
 	if err != nil {
 		log.Fatalf("Критическая ошибка: не удалось подключиться к Redis: %v", err)
 	}

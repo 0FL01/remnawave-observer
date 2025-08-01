@@ -29,6 +29,13 @@ type Config struct {
 	LogChannelBufferSize        int
 	SideEffectWorkerPoolSize    int
 	SideEffectChannelBufferSize int
+
+	// --- ПАРАМЕТРЫ ДЛЯ РЕЖИМА ПОДСЕТЕЙ ---
+	DetectBySubnet    bool          // Включить режим детекции по подсетям
+	MaxSubnetsPerUser int           
+	UserSubnetTTL     time.Duration 
+	SubnetMaskIPv4    int           
+	ExcludedSubnets   map[string]bool 
 }
 
 // New загружает конфигурацию из переменных окружения.
@@ -53,9 +60,21 @@ func New() *Config {
 		LogChannelBufferSize:        getEnvInt("LOG_CHANNEL_BUFFER_SIZE", 100),
 		SideEffectWorkerPoolSize:    getEnvInt("SIDE_EFFECT_WORKER_POOL_SIZE", 10),
 		SideEffectChannelBufferSize: getEnvInt("SIDE_EFFECT_CHANNEL_BUFFER_SIZE", 50),
+
+		// --- Загрузка параметров подсетей ---
+		DetectBySubnet:    getEnvBool("DETECT_BY_SUBNET", false),
+		MaxSubnetsPerUser: getEnvInt("MAX_SUBNETS_PER_USER", 3),
+		UserSubnetTTL:     time.Duration(getEnvInt("USER_SUBNET_TTL_SECONDS", 86400)) * time.Second,
+		SubnetMaskIPv4:    getEnvInt("SUBNET_MASK_IPV4", 24),
+		ExcludedSubnets:   parseSet(getEnv("EXCLUDED_SUBNETS", "")), // <-- НОВОЕ
 	}
 
 	log.Printf("Конфигурация загружена. Порт: %s", cfg.Port)
+	if cfg.DetectBySubnet {
+		log.Printf("!!! РЕЖИМ ОБНАРУЖЕНИЯ: по ПОДСЕТЯМ (/%d). Лимит: %d подсетей на пользователя.", cfg.SubnetMaskIPv4, cfg.MaxSubnetsPerUser)
+	} else {
+		log.Printf("!!! РЕЖИМ ОБНАРУЖЕНИЯ: по IP-адресам. Лимит: %d IP на пользователя.", cfg.MaxIPsPerUser)
+	}
 	log.Printf("Пул воркеров обработки логов: %d воркеров, размер буфера канала: %d", cfg.WorkerPoolSize, cfg.LogChannelBufferSize)
 	log.Printf("Пул воркеров побочных задач (алерты, очистка): %d воркеров, размер буфера канала: %d", cfg.SideEffectWorkerPoolSize, cfg.SideEffectChannelBufferSize)
 	if len(cfg.ExcludedUsers) > 0 {
@@ -63,6 +82,9 @@ func New() *Config {
 	}
 	if len(cfg.ExcludedIPs) > 0 {
 		log.Printf("Загружен список исключений IP-адресов: %d", len(cfg.ExcludedIPs))
+	}
+	if len(cfg.ExcludedSubnets) > 0 {
+		log.Printf("Загружен список исключений подсетей: %d", len(cfg.ExcludedSubnets))
 	}
 	if cfg.DebugEmail != "" {
 		log.Printf("Режим дебага включен для email: %s с лимитом IP: %d", cfg.DebugEmail, cfg.DebugIPLimit)
@@ -82,6 +104,15 @@ func getEnvInt(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if intValue, err := strconv.Atoi(value); err == nil {
 			return intValue
+		}
+	}
+	return defaultValue
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		if boolValue, err := strconv.ParseBool(value); err == nil {
+			return boolValue
 		}
 	}
 	return defaultValue

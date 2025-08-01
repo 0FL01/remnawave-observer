@@ -9,11 +9,11 @@ type LogEntry struct {
 // AlertPayload представляет данные для отправки в вебхук.
 type AlertPayload struct {
 	UserIdentifier   string   `json:"user_identifier"`
-	DetectedIPsCount int      `json:"detected_ips_count"`
+	DetectedIPsCount int      `json:"detected_ips_count"` // Может содержать кол-во IP или подсетей
 	Limit            int      `json:"limit"`
-	AllUserIPs       []string `json:"all_user_ips"`
+	AllUserIPs       []string `json:"all_user_ips"` // Может содержать IP или подсети
 	BlockDuration    string   `json:"block_duration"`
-	ViolationType    string   `json:"violation_type"`
+	ViolationType    string `json:"violation_type"`
 }
 
 // UserIPStats содержит статистику по IP-адресам пользователя для мониторинга.
@@ -39,8 +39,8 @@ type BlockMessage struct {
 
 // CheckResult представляет результат выполнения Lua-скрипта.
 type CheckResult struct {
-	StatusCode     int64
-	CurrentIPCount int64
-	IsNewIP        bool
-	AllUserIPs     []string
+	StatusCode   int64
+	CurrentCount int64
+	IsNew        bool
+	AllUserItems []string
 }
