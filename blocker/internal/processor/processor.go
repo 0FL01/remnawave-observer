@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"regexp"
+	"strings"
 	"sync"
 )
 
@@ -25,6 +27,17 @@ func NewMessageProcessor(l *logger.Logger, exec *command.Executor) *MessageProce
 		logger:   l,
 		executor: exec,
 	}
+}
+
+// isValidIPOrCIDR проверяет, является ли строка валидным IP-адресом или CIDR.
+func isValidIPOrCIDR(s string) bool {
+	// Проверяем CIDR (например, 192.168.1.0/24)
+	if strings.Contains(s, "/") {
+		_, _, err := net.ParseCIDR(s)
+		return err == nil
+	}
+	// Проверяем обычный IP-адрес
+	return net.ParseIP(s) != nil
 }
 
 // Process принимает тело сообщения и выполняет действие по блокировке.
@@ -56,7 +69,16 @@ func (p *MessageProcessor) Process(ctx context.Context, body []byte) error {
 		wg.Add(1)
 		go func(ipAddress string) {
 			defer wg.Done()
-			err := p.executor.RunNftCommand(ctx, "add", "element", "inet", "firewall", "user_blacklist", "{", ipAddress, "timeout", duration, "}")
+
+			// Баг #3: Валидация IP/CIDR перед выполнением nft команды
+			if !isValidIPOrCIDR(ipAddress) {
+				p.logger.Error(fmt.Sprintf("Невалидный IP/CIDR пропущен: %s", ipAddress))
+				return
+			}
+
+			// Баг #1: Объединяем set expression в один аргумент для корректной работы nft
+			setExpr := fmt.Sprintf("{ %s timeout %s }", ipAddress, duration)
+			err := p.executor.RunNftCommand(ctx, "add", "element", "inet", "firewall", "user_blacklist", setExpr)
 			if err != nil {
 				p.logger.Error(fmt.Sprintf("Ошибка при обработке IP %s: %v", ipAddress, err))
 			}

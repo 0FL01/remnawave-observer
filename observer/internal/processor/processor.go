@@ -22,11 +22,15 @@ type LogProcessor struct {
 	cfg               *config.Config
 	logChannel        chan []models.LogEntry // Канал для получения пачек логов
 	sideEffectChannel chan func()            // Канал для побочных задач (алерты, очистка)
+
+	// Кешированные распарсенные подсети для быстрой проверки вложенности
+	excludedSubnetsParsed []*net.IPNet
+	excludedIPsParsed     []*net.IPNet // Для случаев когда в ExcludedIPs указан CIDR
 }
 
 // NewLogProcessor создает новый экземпляр LogProcessor.
 func NewLogProcessor(s storage.IPStorage, p publisher.EventPublisher, a alerter.Notifier, cfg *config.Config) *LogProcessor {
-	return &LogProcessor{
+	lp := &LogProcessor{
 		storage:           s,
 		publisher:         p,
 		alerter:           a,
@@ -34,6 +38,43 @@ func NewLogProcessor(s storage.IPStorage, p publisher.EventPublisher, a alerter.
 		logChannel:        make(chan []models.LogEntry, cfg.LogChannelBufferSize),
 		sideEffectChannel: make(chan func(), cfg.SideEffectChannelBufferSize),
 	}
+
+	// Парсим исключённые подсети один раз при инициализации
+	for subnetStr := range cfg.ExcludedSubnets {
+		_, ipNet, err := net.ParseCIDR(subnetStr)
+		if err != nil {
+			log.Printf("Предупреждение: не удалось распарсить исключённую подсеть '%s': %v", subnetStr, err)
+			continue
+		}
+		lp.excludedSubnetsParsed = append(lp.excludedSubnetsParsed, ipNet)
+	}
+	if len(lp.excludedSubnetsParsed) > 0 {
+		log.Printf("Распарсено %d исключённых подсетей для проверки вложенности", len(lp.excludedSubnetsParsed))
+	}
+
+	// Парсим исключённые IP (поддержка CIDR в EXCLUDED_IPS)
+	for ipStr := range cfg.ExcludedIPs {
+		// Пробуем распарсить как CIDR
+		if _, ipNet, err := net.ParseCIDR(ipStr); err == nil {
+			lp.excludedIPsParsed = append(lp.excludedIPsParsed, ipNet)
+		} else if ip := net.ParseIP(ipStr); ip != nil {
+			// Одиночный IP -> преобразуем в /32 CIDR
+			var mask net.IPMask
+			if ip.To4() != nil {
+				mask = net.CIDRMask(32, 32)
+			} else {
+				mask = net.CIDRMask(128, 128)
+			}
+			lp.excludedIPsParsed = append(lp.excludedIPsParsed, &net.IPNet{IP: ip, Mask: mask})
+		} else {
+			log.Printf("Предупреждение: не удалось распарсить исключённый IP '%s'", ipStr)
+		}
+	}
+	if len(lp.excludedIPsParsed) > 0 {
+		log.Printf("Распарсено %d исключённых IP/CIDR для проверки вложенности", len(lp.excludedIPsParsed))
+	}
+
+	return lp
 }
 
 // StartWorkerPool запускает пул горутин-воркеров для обработки логов.
@@ -279,29 +320,69 @@ func (p *LogProcessor) getDebugMarker(userEmail string) string {
 }
 
 func (p *LogProcessor) filterExcludedIPs(ips []string, email string) []string {
+	if len(p.excludedIPsParsed) == 0 {
+		return ips
+	}
+
 	var filtered []string
-	for _, ip := range ips {
-		if p.cfg.ExcludedIPs[ip] {
-			log.Printf("IP-адрес %s для пользователя %s пропущен, так как находится в списке исключений.", ip, email)
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			// Невалидный IP — пропускаем в блокировку (пусть nft разбирается)
+			filtered = append(filtered, ipStr)
 			continue
 		}
-		filtered = append(filtered, ip)
+
+		excluded := false
+		for _, excludedNet := range p.excludedIPsParsed {
+			if excludedNet.Contains(ip) {
+				log.Printf("IP-адрес %s для пользователя %s пропущен (входит в исключённую сеть %s)", ipStr, email, excludedNet.String())
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
+			filtered = append(filtered, ipStr)
+		}
 	}
 	return filtered
 }
 
-// filterExcludedSubnets проверяет список подсетей на наличие в белом списке.
+// filterExcludedSubnets проверяет список подсетей на вложенность в белый список.
+// Подсеть считается исключённой, если она полностью входит в любую из исключённых подсетей.
 func (p *LogProcessor) filterExcludedSubnets(subnets []string, email string) []string {
-	if len(p.cfg.ExcludedSubnets) == 0 {
+	if len(p.excludedSubnetsParsed) == 0 {
 		return subnets
 	}
+
 	var filtered []string
-	for _, subnet := range subnets {
-		if p.cfg.ExcludedSubnets[subnet] {
-			log.Printf("Подсеть %s для пользователя %s пропущена, так как находится в списке исключений.", subnet, email)
+	for _, subnetStr := range subnets {
+		_, subnetNet, err := net.ParseCIDR(subnetStr)
+		if err != nil {
+			// Невалидная подсеть — пропускаем в блокировку
+			filtered = append(filtered, subnetStr)
 			continue
 		}
-		filtered = append(filtered, subnet)
+
+		excluded := false
+		for _, excludedNet := range p.excludedSubnetsParsed {
+			// Проверяем: входит ли первый IP подсети в исключённую сеть
+			// Это означает, что subnetNet является подмножеством excludedNet
+			if excludedNet.Contains(subnetNet.IP) {
+				// Дополнительная проверка: маска subnetNet должна быть >= маски excludedNet
+				// (т.е. subnetNet должна быть меньше или равна excludedNet)
+				excludedOnes, _ := excludedNet.Mask.Size()
+				subnetOnes, _ := subnetNet.Mask.Size()
+				if subnetOnes >= excludedOnes {
+					log.Printf("Подсеть %s для пользователя %s пропущена (входит в исключённую сеть %s)", subnetStr, email, excludedNet.String())
+					excluded = true
+					break
+				}
+			}
+		}
+		if !excluded {
+			filtered = append(filtered, subnetStr)
+		}
 	}
 	return filtered
 }
